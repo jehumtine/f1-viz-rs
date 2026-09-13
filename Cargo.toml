@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "f1-data",
+    "f1-replay",
+]
+resolver = "2"
