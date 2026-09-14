@@ -2,6 +2,7 @@ use std::time::Duration;
 use std::{collections::HashMap, str};
 
 use chrono::{DateTime, Utc};
+use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -65,27 +66,52 @@ pub struct CarPosition {
 
 #[derive(Debug, Deserialize)]
 pub struct RawCarDataBlock {
+    #[serde(rename = "Entries")]
     pub entries: Vec<RawCarDataEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RawCarDataEntry {
+    #[serde(rename = "Utc")]
     pub utc: String,
+    #[serde(rename = "Cars")]
     pub cars: HashMap<String, RawCarChannels>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RawCarChannels {
+    #[serde(rename = "Channels")]
     pub channels: HashMap<String, i32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Display)]
+#[display(
+    "Timestamp: {timestamp}\n\
+     Cars: \n{}",
+    "fmt_cars(cars)"
+)]
 pub struct CarData {
     pub timestamp: DateTime<Utc>,
     pub cars: HashMap<u8, CarTelemetry>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[allow(dead_code)]
+fn fmt_cars(cars: &HashMap<u8, CarTelemetry>) -> String {
+    cars.iter()
+        .map(|(id, telemetry)| format!("  [Car Id {}]\n{}", id, telemetry))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Display)]
+#[display(
+    "RPM: {rpm}\n\
+    Speed: {speed_kph}\n\
+    Gear: {gear}\n\
+    Throttle Pct: {throttle_pct}\n\
+    Brake: {brake} \n\
+    DRS: {drs}"
+)]
 pub struct CarTelemetry {
     pub rpm: u32,
     pub speed_kph: u32,
@@ -109,7 +135,13 @@ pub struct RawSessionInfo {
     pub gmt_offset: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Display)]
+#[display(
+    "Meeting Name: {meeting_name}\n\
+    Country: {country}\n\
+    Session Name: {session_name}\n\
+    Start Date : {start_date}"
+)]
 pub struct SessionInfo {
     pub meeting_name: String,
     pub country: String,
@@ -122,7 +154,15 @@ pub struct RawMeeting {
     #[serde(rename = "Name")]
     pub name: String,
     #[serde(rename = "Country")]
-    pub country: String,
+    pub country: RawCountry,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawCountry {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Code")]
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -159,11 +199,11 @@ pub struct RawWeather {
     #[serde(rename = "Humidity")]
     pub humidity: String,
     #[serde(rename = "Rainfall")]
-    pub rainfall: bool,
+    pub rainfall: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct WeatherSample {
+pub struct Weather {
     pub air_temp_c: f32,
     pub track_temp_c: f32,
     pub humidity_pct: u8,
@@ -178,6 +218,24 @@ pub struct RawRaceControl {
     pub message: String,
     #[serde(rename = "Flag")]
     pub flag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawRaceControlBlock {
+    #[serde(rename = "Messages")]
+    pub messages: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RawRaceControlMessage {
+    #[serde(rename = "Category")]
+    pub category: String,
+    #[serde(rename = "Message")]
+    pub message: String,
+    #[serde(rename = "Flag")]
+    pub flag: Option<String>,
+    #[serde(rename = "RacingNumber")]
+    pub racing_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

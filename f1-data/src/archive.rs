@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 
 use crate::{
@@ -9,8 +9,8 @@ use crate::{
     error::F1Error,
     model::{
         CarData, CarPosition, CarTelemetry, Driver, PositionSample, RaceControlMessage,
-        RawCarDataBlock, RawDriver, RawLapCount, RawOffset, RawPositionBlock, RawRaceControl,
-        RawSessionInfo, RawWeather, SessionInfo, WeatherSample,
+        RawCarDataBlock, RawDriver, RawLapCount, RawOffset, RawPositionBlock, RawRaceControlBlock,
+        RawRaceControlMessage, RawSessionInfo, RawWeather, SessionInfo, Weather,
     },
 };
 
@@ -144,10 +144,10 @@ impl F1ArchiveClient {
         let text = resp.text().await?;
 
         let raw: RawSessionInfo = serde_json::from_str(&text)?;
-        let meeting_name = raw.clone().meeting.map(|m| m.name).unwrap();
-        let country = raw.meeting.map(|m| m.country).unwrap();
+        let meeting_name = raw.meeting.as_ref().map(|m| m.name.clone()).unwrap();
+        let country = raw.meeting.map(|m| m.country.name.clone()).unwrap();
         let session_name = raw.session_name;
-        let start_date = raw.start_date.parse::<DateTime<Utc>>()?;
+        let start_date = parse_f1_date(&raw.start_date)?;
 
         Ok(SessionInfo {
             meeting_name,
@@ -158,7 +158,7 @@ impl F1ArchiveClient {
     }
 
     pub async fn get_lap_count(&self) -> Result<Vec<(RawOffset, u32, u32)>, F1Error> {
-        let lines = self.fetch_stream("TrackStatus.jsonStream").await?;
+        let lines = self.fetch_stream("LapCount.jsonStream").await?;
         let mut events = Vec::new();
 
         for (ts_str, payload) in lines {
@@ -170,20 +170,23 @@ impl F1ArchiveClient {
         Ok(events)
     }
 
-    pub async fn get_weather_data(&self) -> Result<Vec<(RawOffset, WeatherSample)>, F1Error> {
+    pub async fn get_weather_data(&self) -> Result<Vec<(RawOffset, Weather)>, F1Error> {
         let lines = self.fetch_stream("WeatherData.jsonStream").await?;
         let mut events = Vec::new();
 
         for (ts_str, payload) in lines {
             let raw: RawWeather = serde_json::from_str(&payload)?;
             let offset = parse_offset(&ts_str)?;
+
+            let is_raining = raw.rainfall == "1" || raw.rainfall.eq_ignore_ascii_case("true");
+
             events.push((
                 RawOffset(offset),
-                WeatherSample {
+                Weather {
                     air_temp_c: raw.air_temp.parse().unwrap_or(0.0),
                     track_temp_c: raw.track_tmep.parse().unwrap_or(0.0),
                     humidity_pct: raw.humidity.parse().unwrap_or(0),
-                    is_raining: raw.rainfall,
+                    is_raining,
                 },
             ));
         }
@@ -197,16 +200,26 @@ impl F1ArchiveClient {
         let mut events = Vec::new();
 
         for (ts_str, payload) in lines {
-            let raw: RawRaceControl = serde_json::from_str(&payload)?;
+            let raw: RawRaceControlBlock = serde_json::from_str(&payload)?;
             let offset = parse_offset(&ts_str)?;
-            events.push((
-                RawOffset(offset),
-                RaceControlMessage {
-                    category: raw.category,
-                    message: raw.message,
-                    flag: raw.flag,
-                },
-            ));
+
+            let message_list = match raw.messages {
+                serde_json::Value::Array(arr) => arr,
+                serde_json::Value::Object(map) => map.into_values().collect(),
+                _ => vec![],
+            };
+
+            for msg_value in message_list {
+                let msg: RawRaceControlMessage = serde_json::from_value(msg_value)?;
+                events.push((
+                    RawOffset(offset),
+                    RaceControlMessage {
+                        category: msg.category,
+                        message: msg.message,
+                        flag: msg.flag,
+                    },
+                ));
+            }
         }
         Ok(events)
     }
@@ -233,4 +246,23 @@ fn parse_offset(ts_str: &str) -> Result<Duration, F1Error> {
     let nanos = ((secs.fract() * 1_000_000_000.0) as u32).min(999_999_999);
 
     Ok(Duration::new(total_secs, nanos))
+}
+
+fn parse_f1_date(date_str: &str) -> Result<DateTime<Utc>, F1Error> {
+    if let Ok(dt) = date_str.parse::<DateTime<Utc>>() {
+        return Ok(dt);
+    }
+
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(Utc.from_utc_datetime(&ndt));
+    }
+
+    if let Ok(naive_date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        let midnight = naive_date.and_hms_opt(0, 0, 0).unwrap();
+        return Ok(Utc.from_utc_datetime(&midnight));
+    }
+    Err(F1Error::UnexpectedFormat(format!(
+        "Could not parse date: '{}'",
+        date_str
+    )))
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+derive_more = { version = "2.1.1", features = ["display"] }
 f1_data = "0.0.2"
 flate2 = "1.1.10"
 reqwest = {version = "0.13.5", features = ["json"]}
