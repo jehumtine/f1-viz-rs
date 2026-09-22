@@ -11,12 +11,15 @@ pub enum F1Error {
     #[error("Base64 decoding failed: {0}")]
     Base64(#[from] base64::DecodeError),
 
-    #[error("Decompression failed: {0}")]
-    Decompress(#[from] std::io::Error),
+    #[error("I/O operation failed: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("Timestamp parsing failed: {0}")]
     TimeParse(#[from] chrono::ParseError),
 
     #[error("Unexpected data format: {0}")]
     UnexpectedFormat(String),
+
+    #[error("Bincode serialization/deserialization failed: {0}")]
+    Bincode(String),
 }

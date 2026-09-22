@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RawDriver {
     #[serde(rename = "RacingNumber")]
     pub racing_number: String,
@@ -21,7 +21,7 @@ pub struct RawDriver {
     pub team_colour: String, //Hex code
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Driver {
     pub number: u8,
     pub code: String,
@@ -30,7 +30,13 @@ pub struct Driver {
     pub color: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PositionRoot {
+    #[serde(rename = "Position")]
+    pub position: Vec<RawPositionBlock>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawPositionBlock {
     #[serde(rename = "Timestamp")]
     pub timestamp: String,
@@ -38,7 +44,7 @@ pub struct RawPositionBlock {
     pub entries: HashMap<String, RawPositionEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawPositionEntry {
     #[serde(rename = "Status")]
     pub status: String, // "OnTrack", "OffTrack", "PitLane"
@@ -50,13 +56,13 @@ pub struct RawPositionEntry {
     pub z: i32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionSample {
     pub timestamp: DateTime<Utc>,
     pub cars: HashMap<u8, CarPosition>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CarPosition {
     pub x_m: f64,
     pub y_m: f64,
@@ -64,13 +70,19 @@ pub struct CarPosition {
     pub on_track: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CarDataRoot {
+    #[serde(rename = "Entries")]
+    pub entries: Vec<RawCarDataEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawCarDataBlock {
     #[serde(rename = "Entries")]
     pub entries: Vec<RawCarDataEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawCarDataEntry {
     #[serde(rename = "Utc")]
     pub utc: String,
@@ -78,13 +90,13 @@ pub struct RawCarDataEntry {
     pub cars: HashMap<String, RawCarChannels>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawCarChannels {
     #[serde(rename = "Channels")]
     pub channels: HashMap<String, i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Display)]
+#[derive(Debug, Clone, Serialize, Display, Deserialize)]
 #[display(
     "Timestamp: {timestamp}\n\
      Cars: \n{}",
@@ -103,7 +115,7 @@ fn fmt_cars(cars: &HashMap<u8, CarTelemetry>) -> String {
         .join("\n")
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Display)]
+#[derive(Debug, Clone, Copy, Serialize, Display, Deserialize)]
 #[display(
     "RPM: {rpm}\n\
     Speed: {speed_kph}\n\
@@ -121,7 +133,7 @@ pub struct CarTelemetry {
     pub drs: u8,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawSessionInfo {
     #[serde(rename = "Meeting")]
     pub meeting: Option<RawMeeting>,
@@ -135,7 +147,7 @@ pub struct RawSessionInfo {
     pub gmt_offset: String,
 }
 
-#[derive(Debug, Clone, Serialize, Display)]
+#[derive(Debug, Clone, Serialize, Display, Deserialize)]
 #[display(
     "Meeting Name: {meeting_name}\n\
     Country: {country}\n\
@@ -149,7 +161,7 @@ pub struct SessionInfo {
     pub start_date: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawMeeting {
     #[serde(rename = "Name")]
     pub name: String,
@@ -157,7 +169,7 @@ pub struct RawMeeting {
     pub country: RawCountry,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawCountry {
     #[serde(rename = "Name")]
     pub name: String,
@@ -168,7 +180,7 @@ pub struct RawCountry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RawOffset(pub Duration);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawTrackStatus {
     #[serde(rename = "Status")]
     pub status: u8,
@@ -176,13 +188,13 @@ pub struct RawTrackStatus {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackStatusEvent {
     pub status: u8,
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawLapCount {
     #[serde(rename = "CurrentLap")]
     pub current_lap: u32,
@@ -190,7 +202,7 @@ pub struct RawLapCount {
     pub total_laps: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawWeather {
     #[serde(rename = "AirTemp")]
     pub air_temp: String,
@@ -202,7 +214,7 @@ pub struct RawWeather {
     pub rainfall: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Weather {
     pub air_temp_c: f32,
     pub track_temp_c: f32,
@@ -210,7 +222,7 @@ pub struct Weather {
     pub is_raining: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawRaceControl {
     #[serde(rename = "Category")]
     pub category: String,
@@ -220,13 +232,13 @@ pub struct RawRaceControl {
     pub flag: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawRaceControlBlock {
     #[serde(rename = "Messages")]
     pub messages: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RawRaceControlMessage {
     #[serde(rename = "Category")]
     pub category: String,
@@ -238,7 +250,7 @@ pub struct RawRaceControlMessage {
     pub racing_number: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaceControlMessage {
     pub category: String,
     pub message: String,

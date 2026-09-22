@@ -1,16 +1,19 @@
-use std::collections::HashMap;
-use std::time::Duration;
-
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use directories::ProjectDirs;
+use rayon::prelude::*;
 use reqwest::Client;
+use std::time::Duration;
+use std::{collections::HashMap, path::PathBuf};
+use tokio::fs::*;
 
+use crate::model::{CarDataRoot, PositionRoot};
 use crate::{
     decode::decode_f1_z_payload,
     error::F1Error,
     model::{
-        CarData, CarPosition, CarTelemetry, Driver, PositionSample, RaceControlMessage,
-        RawCarDataBlock, RawDriver, RawLapCount, RawOffset, RawPositionBlock, RawRaceControlBlock,
-        RawRaceControlMessage, RawSessionInfo, RawWeather, SessionInfo, Weather,
+        CarData, CarPosition, CarTelemetry, Driver, PositionSample, RaceControlMessage, RawDriver,
+        RawLapCount, RawOffset, RawRaceControlBlock, RawRaceControlMessage, RawSessionInfo,
+        RawWeather, SessionInfo, Weather,
     },
 };
 
@@ -19,20 +22,45 @@ const BASE_URL: &str = "https://livetiming.formula1.com/static";
 pub struct F1ArchiveClient {
     client: Client,
     session_path: String,
+    cache_dir: PathBuf,
 }
 
 impl F1ArchiveClient {
     pub fn new(session_path: String) -> Self {
+        let proj_dirs =
+            ProjectDirs::from("", "", "f1-livetiming").expect("Failed to find cache directory");
+
+        let safe_session_name = session_path.replace('/', "_").replace('\\', "_");
+        let cache_dir = proj_dirs.cache_dir().join(safe_session_name);
+
+        std::fs::create_dir_all(&cache_dir).expect("Failed to create cache dir");
         Self {
             client: Client::new(),
             session_path,
+            cache_dir,
         }
     }
 
-    async fn fetch_stream(&self, filename: &str) -> Result<Vec<(String, String)>, F1Error> {
+    async fn fetch_raw(&self, filename: &str) -> Result<String, F1Error> {
+        let cache_file = self.cache_dir.join(filename);
+
+        if cache_file.exists() {
+            println!("[CACHE HIT] Loading {} from disk", filename);
+            return Ok(read_to_string(&cache_file).await?);
+        }
+
+        println!("[CACHE MISS] Downloading {} from F1 API", filename);
         let url = format!("{}{}{}", BASE_URL, self.session_path, filename);
         let resp = self.client.get(&url).send().await?;
         let text = resp.text().await?;
+
+        write(&cache_file, &text).await?;
+
+        Ok(text)
+    }
+
+    async fn fetch_stream(&self, filename: &str) -> Result<Vec<(String, String)>, F1Error> {
+        let text = self.fetch_raw(filename).await?;
 
         let mut lines = Vec::new();
         for line in text.split("\r\n") {
@@ -46,9 +74,7 @@ impl F1ArchiveClient {
     }
 
     pub async fn get_driver_list(&self) -> Result<HashMap<u8, Driver>, F1Error> {
-        let url = format!("{}{}DriverList.json", BASE_URL, self.session_path);
-        let resp = self.client.get(&url).send().await?;
-        let text = resp.text().await?;
+        let text = self.fetch_raw("DriverList.json").await?;
 
         let raw_map: HashMap<String, RawDriver> = serde_json::from_str(&text)?;
 
@@ -71,19 +97,29 @@ impl F1ArchiveClient {
     }
 
     pub async fn get_position_data(&self) -> Result<Vec<PositionSample>, F1Error> {
+        let cache_file = self.cache_dir.join("positions.bin");
+
+        if cache_file.exists() {
+            println!("[BIN CACHE HIT] Loading parsed positions...");
+            let bytes = tokio::fs::read(&cache_file).await?;
+            return Ok(bincode::deserialize(&bytes).map_err(|e| F1Error::Bincode(e.to_string()))?);
+        }
+
+        println!("[BIN CACHE MISS] Parsing positions from JSON...");
         let lines = self.fetch_stream("Position.z.jsonStream").await?;
-        let mut samples = Vec::new();
 
-        for (_, payload) in lines {
-            let json: serde_json::Value = decode_f1_z_payload(&payload)?;
+        let results: Result<Vec<Vec<PositionSample>>, F1Error> = lines
+            .par_iter()
+            .map(|(_, payload)| {
+                let json_string = decode_f1_z_payload(payload)?;
+                let root: PositionRoot = serde_json::from_str(&json_string)?;
 
-            if let Some(positions) = json.get("Position").and_then(|v| v.as_array()) {
-                for pos_block in positions {
-                    let block: RawPositionBlock = serde_json::from_value(pos_block.clone())?;
-                    let timestamp = block.timestamp.parse::<DateTime<Utc>>()?;
-
+                let mut block_samples = Vec::new();
+                for pos_block in root.position {
+                    let timestamp = pos_block.timestamp.parse::<DateTime<Utc>>()?;
                     let mut cars = HashMap::new();
-                    for (num_str, entry) in block.entries {
+
+                    for (num_str, entry) in pos_block.entries {
                         if let Ok(num) = num_str.parse::<u8>() {
                             cars.insert(
                                 num,
@@ -96,53 +132,81 @@ impl F1ArchiveClient {
                             );
                         }
                     }
-                    samples.push(PositionSample { timestamp, cars });
+                    block_samples.push(PositionSample { timestamp, cars });
                 }
-            }
-        }
+                Ok(block_samples)
+            })
+            .collect();
+        let samples = results?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<PositionSample>>();
+
+        println!("[BIN CACHE] Saving parsed positions to binary cache...");
+        let bytes = bincode::serialize(&samples).map_err(|e| F1Error::Bincode(e.to_string()))?;
+        write(&cache_file, &bytes).await?;
+
         Ok(samples)
     }
 
     pub async fn get_car_data(&self) -> Result<Vec<CarData>, F1Error> {
-        let lines = self.fetch_stream("CarData.z.jsonStream").await?;
-        let mut samples = Vec::new();
+        let cache_file = self.cache_dir.join("car_data.bin");
 
-        for (_, payload) in lines {
-            let json: serde_json::Value = decode_f1_z_payload(&payload)?;
-            let block: RawCarDataBlock = serde_json::from_value(json)?;
-
-            for entry in block.entries {
-                let timestamp = entry.utc.parse::<DateTime<Utc>>()?;
-                let mut cars = HashMap::new();
-
-                for (num_str, raw_car) in entry.cars {
-                    if let Ok(num) = num_str.parse::<u8>() {
-                        let ch = &raw_car.channels;
-
-                        cars.insert(
-                            num,
-                            CarTelemetry {
-                                rpm: ch.get("0").copied().unwrap_or(0) as u32,
-                                speed_kph: ch.get("2").copied().unwrap_or(0) as u32,
-                                gear: ch.get("3").copied().unwrap_or(0) as u8,
-                                throttle_pct: ch.get("4").copied().unwrap_or(0) as u8,
-                                brake: ch.get("5").copied().unwrap_or(0) == 1,
-                                drs: ch.get("45").copied().unwrap_or(0) as u8,
-                            },
-                        );
-                    }
-                }
-                samples.push(CarData { timestamp, cars });
-            }
+        if cache_file.exists() {
+            println!("[BIN CACHE HIT] Loading parsed car data...");
+            let bytes = tokio::fs::read(&cache_file).await?;
+            return Ok(bincode::deserialize(&bytes).map_err(|e| F1Error::Bincode(e.to_string()))?);
         }
+
+        println!("[BIN CACHE MISS] Parsing car data from JSON...");
+        let lines = self.fetch_stream("CarData.z.jsonStream").await?;
+
+        let results: Result<Vec<Vec<CarData>>, F1Error> = lines
+            .par_iter()
+            .map(|(_, payload)| {
+                let json_string = decode_f1_z_payload(payload)?;
+                let root: CarDataRoot = serde_json::from_str(&json_string)?;
+
+                let mut block_samples = Vec::new();
+
+                for entry in root.entries {
+                    let timestamp = entry.utc.parse::<DateTime<Utc>>()?;
+                    let mut cars = HashMap::new();
+
+                    for (num_str, raw_car) in entry.cars {
+                        if let Ok(num) = num_str.parse::<u8>() {
+                            let ch = &raw_car.channels;
+                            cars.insert(
+                                num,
+                                CarTelemetry {
+                                    rpm: ch.get("0").copied().unwrap_or(0) as u32,
+                                    speed_kph: ch.get("2").copied().unwrap_or(0) as u32,
+                                    gear: ch.get("3").copied().unwrap_or(0) as u8,
+                                    throttle_pct: ch.get("4").copied().unwrap_or(0) as u8,
+                                    brake: ch.get("5").copied().unwrap_or(0) == 1,
+                                    drs: ch.get("45").copied().unwrap_or(0) as u8,
+                                },
+                            );
+                        }
+                    }
+                    block_samples.push(CarData { timestamp, cars });
+                }
+
+                Ok(block_samples)
+            })
+            .collect();
+
+        let samples = results?.into_iter().flatten().collect::<Vec<CarData>>();
+
+        println!("[BIN CACHE] Saving parsed car data to binary cache...");
+        let bytes = bincode::serialize(&samples).map_err(|e| F1Error::Bincode(e.to_string()))?;
+        write(&cache_file, &bytes).await?;
+
         Ok(samples)
     }
 
     pub async fn get_session_data(&self) -> Result<SessionInfo, F1Error> {
-        let url = format!("{}{}SessionInfo.json", BASE_URL, self.session_path);
-        let resp = self.client.get(&url).send().await?;
-        let text = resp.text().await?;
-
+        let text = self.fetch_raw("SessionInfo.json").await?;
         let raw: RawSessionInfo = serde_json::from_str(&text)?;
         let meeting_name = raw.meeting.as_ref().map(|m| m.name.clone()).unwrap();
         let country = raw.meeting.map(|m| m.country.name.clone()).unwrap();
