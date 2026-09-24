@@ -6,15 +6,16 @@ use std::time::Duration;
 use std::{collections::HashMap, path::PathBuf};
 use tokio::fs::*;
 
-use crate::model::{CarDataRoot, PositionRoot};
+use crate::api::decode::decode_f1_z_payload;
+use crate::model::domain::{CarDataRoot, PositionRoot, SessionInfo, Weather};
+use crate::model::raw::{
+    RawDriver, RawLapCount, RawOffset, RawRaceControlBlock, RawRaceControlMessage, RawSessionInfo,
+    RawTrackStatus, RawWeather,
+};
+use crate::model::time::parse_f1_offset;
 use crate::{
-    decode::decode_f1_z_payload,
-    error::F1Error,
-    model::{
-        CarData, CarPosition, CarTelemetry, Driver, PositionSample, RaceControlMessage, RawDriver,
-        RawLapCount, RawOffset, RawRaceControlBlock, RawRaceControlMessage, RawSessionInfo,
-        RawWeather, SessionInfo, Weather,
-    },
+    CarData, CarPosition, CarTelemetry, Driver, F1Error, PositionSample, RaceControlMessage,
+    TrackStatusEvent,
 };
 
 const BASE_URL: &str = "https://livetiming.formula1.com/static";
@@ -110,13 +111,15 @@ impl F1ArchiveClient {
 
         let results: Result<Vec<Vec<PositionSample>>, F1Error> = lines
             .par_iter()
-            .map(|(_, payload)| {
+            .map(|(ts_prefix, payload)| {
                 let json_string = decode_f1_z_payload(payload)?;
                 let root: PositionRoot = serde_json::from_str(&json_string)?;
 
                 let mut block_samples = Vec::new();
                 for pos_block in root.position {
-                    let timestamp = pos_block.timestamp.parse::<DateTime<Utc>>()?;
+                    let offset = parse_f1_offset(ts_prefix)?;
+                    let absolute = pos_block.timestamp.parse::<DateTime<Utc>>().ok();
+
                     let mut cars = HashMap::new();
 
                     for (num_str, entry) in pos_block.entries {
@@ -132,7 +135,11 @@ impl F1ArchiveClient {
                             );
                         }
                     }
-                    block_samples.push(PositionSample { timestamp, cars });
+                    block_samples.push(PositionSample {
+                        offset,
+                        absolute,
+                        cars,
+                    });
                 }
                 Ok(block_samples)
             })
@@ -163,14 +170,14 @@ impl F1ArchiveClient {
 
         let results: Result<Vec<Vec<CarData>>, F1Error> = lines
             .par_iter()
-            .map(|(_, payload)| {
+            .map(|(ts_prefix, payload)| {
                 let json_string = decode_f1_z_payload(payload)?;
                 let root: CarDataRoot = serde_json::from_str(&json_string)?;
 
                 let mut block_samples = Vec::new();
 
                 for entry in root.entries {
-                    let timestamp = entry.utc.parse::<DateTime<Utc>>()?;
+                    let offset = parse_f1_offset(ts_prefix)?;
                     let mut cars = HashMap::new();
 
                     for (num_str, raw_car) in entry.cars {
@@ -189,7 +196,7 @@ impl F1ArchiveClient {
                             );
                         }
                     }
-                    block_samples.push(CarData { timestamp, cars });
+                    block_samples.push(CarData { offset, cars });
                 }
 
                 Ok(block_samples)
@@ -221,15 +228,14 @@ impl F1ArchiveClient {
         })
     }
 
-    pub async fn get_lap_count(&self) -> Result<Vec<(RawOffset, u32, u32)>, F1Error> {
+    pub async fn get_lap_count(&self) -> Result<Vec<(RawOffset, u32, Option<u32>)>, F1Error> {
         let lines = self.fetch_stream("LapCount.jsonStream").await?;
         let mut events = Vec::new();
 
         for (ts_str, payload) in lines {
             let raw: RawLapCount = serde_json::from_str(&payload)?;
             let offset = parse_offset(&ts_str)?;
-            let total = raw.total_laps.unwrap_or(raw.current_lap);
-            events.push((RawOffset(offset), raw.current_lap, total));
+            events.push((RawOffset(offset), raw.current_lap, raw.total_laps));
         }
         Ok(events)
     }
@@ -284,6 +290,27 @@ impl F1ArchiveClient {
                     },
                 ));
             }
+        }
+        Ok(events)
+    }
+
+    pub async fn get_track_status(&self) -> Result<Vec<(RawOffset, TrackStatusEvent)>, F1Error> {
+        let lines = self.fetch_stream("TrackStatus.jsonStream").await?;
+        let mut events = Vec::new();
+
+        for (ts_str, payload) in lines {
+            let raw: RawTrackStatus = serde_json::from_str(&payload)?;
+            let offset = parse_f1_offset(&ts_str)?;
+
+            let status_code = raw.status.parse::<u8>().unwrap_or(0);
+
+            events.push((
+                offset,
+                TrackStatusEvent {
+                    status: status_code,
+                    message: raw.message,
+                },
+            ));
         }
         Ok(events)
     }
