@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+bevy = "0.19.1"
+bevy_egui = "0.42.0"
+f1-data = { path = "../f1-data" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+
