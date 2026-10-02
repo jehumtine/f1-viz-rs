@@ -9,7 +9,8 @@ use f1_data::engine::timeline::Timeline;
 use f1_data::engine::track::CarTrack;
 use f1_data::model::domain::{Driver, SessionInfo};
 
-use crate::scene::track::{TrackFrame, derive_track_frame};
+use crate::race;
+use crate::scene::track::{P2, TrackFrame, derive_track_frame};
 use crate::theme::TeamPalette;
 
 #[derive(Resource)]
@@ -20,6 +21,9 @@ pub struct SessionBundle {
     pub palette: TeamPalette,
     pub info: SessionInfo,
     pub track: TrackFrame,
+    pub cl: race::CenterlineIndex,
+    pub crossings: HashMap<u8, Vec<f64>>,
+    pub race_start: f64,
 }
 
 pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
@@ -31,6 +35,20 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
     let laps = client.get_lap_count().await.context("lap count")?; // moved up
 
     let track = derive_track_frame(&positions, &laps).context("track derivation")?;
+    let cl = race::CenterlineIndex::build(&track.centerline);
+    let mut per_driver: HashMap<u8, Vec<(f64, P2)>> = HashMap::new();
+    for s in &positions {
+        let t = s.offset.0.as_secs_f64();
+        for (&num, p) in &s.cars {
+            if p.on_track {
+                per_driver
+                    .entry(num)
+                    .or_default()
+                    .push((t, P2::new(p.x_m as f32, p.y_m as f32)));
+            }
+        }
+    }
+    let crossings = race::build_crossings(&per_driver, &cl);
     #[cfg(debug_assertions)]
     let _ = std::fs::write("track_debug.svg", track.to_svg());
     let car_data = client.get_car_data().await.context("car data")?;
@@ -47,6 +65,7 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
         .keys()
         .map(|&n| (n, CarTrack::build(n, &positions, &car_data)))
         .collect();
+    let race_start = race::race_start(&laps);
 
     //TODO: make this efficient
     let timeline = Timeline::from_feeds(
@@ -55,7 +74,7 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
         status,
         weather,
         messages,
-        laps,
+        laps.to_vec(),
     );
     let player = SessionPlayer::new(timeline, tracks);
     let palette = TeamPalette::from_drivers(&drivers);
@@ -67,5 +86,8 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
         palette,
         info,
         track,
+        cl,
+        crossings,
+        race_start,
     })
 }

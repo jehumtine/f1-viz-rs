@@ -99,7 +99,7 @@ pub struct TrackStatusEvent {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Weather {
     pub air_temp_c: f32,
     pub track_temp_c: f32,

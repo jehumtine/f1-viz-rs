@@ -1,5 +1,8 @@
+mod hud;
+mod leaderboard;
 mod load;
 mod playback;
+mod race;
 mod scene;
 mod theme;
 
@@ -141,7 +144,7 @@ fn update_cars(
     }
 }
 
-fn announce(bundle: Res<SessionBundle>) {
+fn announce(mut bundle: ResMut<SessionBundle>) {
     info!(
         "ready: {} · {} · span {} · {} drivers · centerline {} pts · lap {:.0} m",
         bundle.info.meeting_name,
@@ -151,6 +154,25 @@ fn announce(bundle: Res<SessionBundle>) {
         bundle.track.centerline.len(),
         bundle.track.lap_len_m,
     );
+    let t = 3600.0;
+    let frame = bundle
+        .player
+        .frame_at(RawOffset(std::time::Duration::from_secs_f64(t)));
+    let rows = race::compute_leaderboard(
+        &frame.cars,
+        &bundle.cl,
+        &bundle.crossings,
+        t,
+        bundle.race_start,
+    );
+    for (i, r) in rows.iter().take(5).enumerate() {
+        let code = bundle
+            .drivers
+            .get(&r.num)
+            .map(|d| d.code.clone())
+            .unwrap_or_else(|| "?".into());
+        info!("P{} {} lap {} {:?}", i + 1, code, r.lap, r.gap);
+    }
 }
 
 fn setup_fonts(mut contexts: EguiContexts) -> Result {
@@ -316,12 +338,11 @@ struct FpsAcc {
 fn debug_transport(
     mut contexts: EguiContexts,
     mut clock: ResMut<playback::PlaybackClock>,
-    bundle: Option<Res<SessionBundle>>,
+    mut bundle: Option<ResMut<SessionBundle>>,
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut acc: Local<FpsAcc>,
 ) {
-    // FPS calculation
     acc.frames += 1;
     let now = time.elapsed_secs();
     if now - acc.window_start >= 1.0 {
@@ -331,17 +352,32 @@ fn debug_transport(
     }
     let fps = acc.value;
 
-    let (Some(bundle), Ok(ctx)) = (bundle.as_ref(), contexts.ctx_mut()) else {
+    let (Some(bundle), Ok(ctx)) = (bundle.as_mut(), contexts.ctx_mut()) else {
         return;
     };
     let max_secs = bundle.player.duration().0.as_secs_f32();
+    let frame = bundle.player.frame_at(RawOffset(clock.t));
 
     let mut root_ui = egui::Ui::new(
         ctx.clone(),
-        "transport".into(),
+        "main_ui".into(),
         egui::UiBuilder::new().max_rect(ctx.viewport_rect()),
     );
 
+    // HUD top bar
+    hud::render_hud(&mut root_ui, &bundle.info, &frame, clock.t);
+
+    let rows = race::compute_leaderboard(
+        &frame.cars,
+        &bundle.cl,
+        &bundle.crossings,
+        clock.t.as_secs_f64(),
+        bundle.race_start,
+    );
+
+    leaderboard::render_leaderboard(&mut root_ui, &rows, &bundle.drivers, &bundle.palette);
+
+    // Transport bar (existing)
     egui::Panel::bottom("transport")
         .frame(egui::Frame::NONE.fill(egui::Color32::from_black_alpha(140)))
         .show(&mut root_ui, |ui| {
