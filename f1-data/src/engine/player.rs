@@ -16,11 +16,11 @@ pub struct Frame {
 }
 
 pub struct SessionPlayer {
-    timeline: Timeline,
-    tracks: HashMap<u8, CarTrack>,
-    cursor: usize,
-    current_t: RawOffset,
-    state: SessionState,
+    pub timeline: Timeline,
+    pub tracks: HashMap<u8, CarTrack>,
+    pub cursor: usize,
+    pub current_t: RawOffset,
+    pub state: SessionState,
 }
 
 impl SessionPlayer {

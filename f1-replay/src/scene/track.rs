@@ -52,9 +52,6 @@ impl TrackFrame {
             self.bounds_max.y - self.bounds_min.y,
         )
     }
-    pub fn point_spacing_m(&self) -> f32 {
-        self.lap_len_m / CENTERLINE_POINTS as f32
-    }
 
     pub fn to_svg(&self) -> String {
         let mut s = format!(
