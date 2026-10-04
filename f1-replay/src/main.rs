@@ -144,7 +144,7 @@ fn update_cars(
     }
 }
 
-fn announce(mut bundle: ResMut<SessionBundle>) {
+fn announce(mut bundle: ResMut<SessionBundle>, clock: Res<playback::PlaybackClock>) {
     info!(
         "ready: {} · {} · span {} · {} drivers · centerline {} pts · lap {:.0} m",
         bundle.info.meeting_name,
@@ -154,17 +154,15 @@ fn announce(mut bundle: ResMut<SessionBundle>) {
         bundle.track.centerline.len(),
         bundle.track.lap_len_m,
     );
+
+    bundle.race.debug_crossings(2);
+    bundle.race.debug_crossings(1);
+
     let t = 3600.0;
     let frame = bundle
         .player
         .frame_at(RawOffset(std::time::Duration::from_secs_f64(t)));
-    let rows = race::compute_leaderboard(
-        &frame.cars,
-        &bundle.cl,
-        &bundle.crossings,
-        t,
-        bundle.race_start,
-    );
+    let rows = bundle.race.classify(t, &frame.cars);
     for (i, r) in rows.iter().take(5).enumerate() {
         let code = bundle
             .drivers
@@ -367,13 +365,7 @@ fn debug_transport(
     // HUD top bar
     hud::render_hud(&mut root_ui, &bundle.info, &frame, clock.t);
 
-    let rows = race::compute_leaderboard(
-        &frame.cars,
-        &bundle.cl,
-        &bundle.crossings,
-        clock.t.as_secs_f64(),
-        bundle.race_start,
-    );
+    let rows = bundle.race.classify(clock.t.as_secs_f64(), &frame.cars);
 
     leaderboard::render_leaderboard(&mut root_ui, &rows, &bundle.drivers, &bundle.palette);
 

@@ -116,6 +116,10 @@ impl CarTrack {
         })
     }
 
+    pub fn data_end(&self) -> f64 {
+        self.dense.last().map(|q| q.0 as f64).unwrap_or(0.0)
+    }
+
     fn interpolate_position(&self, t: RawOffset) -> Option<(CarPosition, bool)> {
         let ts = t.0.as_secs_f64();
 

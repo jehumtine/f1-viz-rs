@@ -62,33 +62,6 @@ impl CenterlineIndex {
     }
 }
 
-pub fn build_crossings(
-    per_driver: &HashMap<u8, Vec<(f64, P2)>>,
-    cl: &CenterlineIndex,
-) -> HashMap<u8, Vec<f64>> {
-    let mut out = HashMap::new();
-    for (&num, samples) in per_driver {
-        let mut crossings = Vec::new();
-        let mut hint = 0usize;
-        let mut prev_s = 0.0f32;
-        for (i, &(t, p)) in samples.iter().enumerate() {
-            let idx = if i == 0 {
-                cl.nearest_index(p.x, p.y)
-            } else {
-                cl.nearest_index_near(p.x, p.y, hint, 20)
-            };
-            let s = cl.cum[idx];
-            if i > 0 && prev_s > 0.85 * cl.total && s < 0.15 * cl.total {
-                crossings.push(t);
-            }
-            hint = idx;
-            prev_s = s;
-        }
-        out.insert(num, crossings);
-    }
-    out
-}
-
 pub fn race_start(lap_events: &[(RawOffset, u32, Option<u32>)]) -> f64 {
     lap_events
         .iter()
@@ -104,9 +77,165 @@ pub fn lap_at(crossings: &[f64], t: f64, race_start: f64) -> u32 {
     b.saturating_sub(a) as u32 + 1
 }
 
+#[derive(Debug, Clone)]
+pub struct DriverRace {
+    pub num: u8,
+    /// Counted race-lap line crossings: anchored, artifacts removed.
+    crossings: Vec<f64>,
+    /// Session time at which this driver left the classification, if ever.
+    retired_at: Option<f64>,
+}
+
+#[derive(Clone)]
+pub struct RaceModel {
+    drivers: Vec<DriverRace>,
+    cl: CenterlineIndex,
+    race_start: f64,
+    lap_est: f64,
+}
+
+impl RaceModel {
+    pub fn build(per_driver: &HashMap<u8, Vec<(f64, P2)>>, cl: CenterlineIndex) -> Self {
+        let lap_est = cl.total as f64 / 60.0;
+        let session_end = per_driver
+            .values()
+            .filter_map(|v| v.last())
+            .map(|(t, _)| *t)
+            .fold(0.0f64, f64::max);
+
+        let mut form: Vec<f64> = Vec::new();
+        for samples in per_driver.values() {
+            let raw = raw_crossings(samples, &cl);
+            let mut best_gap = 2.0 * lap_est;
+            let mut best_end: Option<f64> = None;
+            for w in raw.windows(2) {
+                let g = w[1] - w[0];
+                if g > best_gap && w[1] < 0.5 * session_end {
+                    best_gap = g;
+                    best_end = Some(w[1]);
+                }
+            }
+            if let Some(f) = best_end {
+                form.push(f);
+            }
+        }
+
+        let anchor = if form.is_empty() {
+            0.0
+        } else {
+            form.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            form[form.len() / 2] + 0.5 * lap_est
+        };
+
+        let mut drivers = Vec::new();
+        let mut first_kept: Vec<f64> = Vec::new();
+        for (&num, samples) in per_driver {
+            let mut cs: Vec<f64> = raw_crossings(samples, &cl)
+                .into_iter()
+                .filter(|&c| c > anchor)
+                .collect();
+            cs.dedup_by(|b, a| *b - *a < 0.6 * lap_est);
+            if let Some(&first) = cs.first() {
+                first_kept.push(first);
+            }
+
+            let last_move = last_movement_time(samples);
+            let last_cross = cs.last().copied().unwrap_or(0.0);
+            let retired_at =
+                if last_move < session_end - lap_est && last_cross < session_end - lap_est {
+                    Some(last_move.max(last_cross))
+                } else {
+                    None
+                };
+
+            drivers.push(DriverRace {
+                num,
+                crossings: cs,
+                retired_at,
+            });
+        }
+        drivers.sort_by_key(|d| d.num);
+
+        let race_start = first_kept.into_iter().fold(f64::INFINITY, f64::min);
+
+        Self {
+            drivers,
+            cl,
+            race_start,
+            lap_est,
+        }
+    }
+
+    pub fn debug_crossings(&self, driver_num: u8) {
+        if let Some(d) = self.drivers.iter().find(|d| d.num == driver_num) {
+            eprintln!(
+                "[race] Driver #{} crossings (race_start={:.1}s):",
+                driver_num, self.race_start
+            );
+            for (i, &c) in d.crossings.iter().enumerate() {
+                eprintln!(
+                    "  crossing {}: t={:.1}s (race_start + {:.1}s)",
+                    i + 1,
+                    c,
+                    c - self.race_start
+                );
+            }
+            if let Some(ret) = d.retired_at {
+                eprintln!("  retired_at: {:.1}s", ret);
+            }
+        }
+    }
+
+    /// The entire per-frame path. No heuristics, no thresholds, no new params ever.
+    pub fn classify(&self, t: f64, cars: &HashMap<u8, UnifiedCarState>) -> Vec<LeaderRow> {
+        let mut rows: Vec<LeaderRow> = self
+            .drivers
+            .iter()
+            .filter_map(|d| {
+                let state = cars.get(&d.num)?;
+                Some(LeaderRow {
+                    num: d.num,
+                    lap: d.crossings.partition_point(|&c| c <= t) as u32 + 1,
+                    progress: self
+                        .cl
+                        .progress(state.position.x_m as f32, state.position.y_m as f32),
+                    speed_kph: state.telemetry.speed_kph,
+                    retired: d.retired_at.is_some_and(|r| t >= r),
+                    gap: GapKind::Leader,
+                })
+            })
+            .collect();
+
+        rows.sort_by(|a, b| {
+            a.retired
+                .cmp(&b.retired)
+                .then(b.lap.cmp(&a.lap))
+                .then(b.progress.partial_cmp(&a.progress).unwrap())
+        });
+
+        let pre = t < self.race_start;
+        if let Some(lead) = rows.first().cloned() {
+            let v = (lead.speed_kph as f32 / 3.6).max(20.0);
+            for (i, r) in rows.iter_mut().enumerate() {
+                r.gap = if r.retired {
+                    GapKind::Retired
+                } else if i == 0 || pre {
+                    GapKind::Leader
+                } else if r.lap < lead.lap {
+                    GapKind::Laps(lead.lap - r.lap)
+                } else {
+                    GapKind::Time((lead.progress - r.progress).rem_euclid(self.cl.total) / v)
+                };
+            }
+        }
+        rows
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum GapKind {
     Leader,
+    Retired,
     Time(f32),
     Laps(u32),
 }
@@ -117,6 +246,7 @@ pub struct LeaderRow {
     pub lap: u32,
     pub progress: f32,
     pub speed_kph: u32,
+    pub retired: bool,
     pub gap: GapKind,
 }
 
@@ -126,41 +256,89 @@ pub fn compute_leaderboard(
     crossings: &HashMap<u8, Vec<f64>>,
     t: f64,
     race_start: f64,
+    official_lap: u32,
+    data_end: HashMap<u8, f64>,
 ) -> Vec<LeaderRow> {
     let mut rows: Vec<LeaderRow> = cars
         .iter()
-        .map(|(&num, state)| LeaderRow {
-            num,
-            lap: crossings
-                .get(&num)
-                .map(|c| lap_at(c, t, race_start)) // forward it
-                .unwrap_or(1),
-            progress: cl.progress(state.position.x_m as f32, state.position.y_m as f32),
-            speed_kph: state.telemetry.speed_kph,
-            gap: GapKind::Leader,
+        .map(|(&num, state)| {
+            let progress = {
+                let p = cl.progress(state.position.x_m as f32, state.position.y_m as f32);
+                if p.is_finite() { p } else { 0.0 }
+            };
+            let retired = t > data_end.get(&num).copied().unwrap_or(f64::INFINITY) + 60.0;
+            LeaderRow {
+                num,
+                lap: crossings
+                    .get(&num)
+                    .map(|c| lap_at(c, t, race_start)) // forward it
+                    .unwrap_or(1)
+                    .min(official_lap),
+                progress,
+                speed_kph: state.telemetry.speed_kph,
+                retired,
+                gap: GapKind::Leader,
+            }
         })
         .collect();
 
     // Race order: higher lap first, then further along the lap.
     rows.sort_by(|a, b| {
-        b.lap
-            .cmp(&a.lap)
+        a.retired
+            .cmp(&b.retired)
+            .then(b.lap.cmp(&a.lap))
             .then(b.progress.partial_cmp(&a.progress).unwrap())
     });
 
+    let pre_race = t < race_start;
     if let Some(lead) = rows.first().cloned() {
-        // Floor leader speed so gaps don't explode under SC/pit stops.
         let lead_speed = (lead.speed_kph as f32 / 3.6).max(20.0);
         for (i, row) in rows.iter_mut().enumerate() {
-            if i == 0 {
-                row.gap = GapKind::Leader;
+            if row.retired {
+                row.gap = GapKind::Retired;
+            } else if i == 0 || pre_race {
+                row.gap = GapKind::Leader; // pre-race: order only, no fake gaps
             } else if row.lap < lead.lap {
                 row.gap = GapKind::Laps(lead.lap - row.lap);
             } else {
-                let dist = (lead.progress - row.progress).max(0.0);
+                let dist = (lead.progress - row.progress).rem_euclid(cl.total);
                 row.gap = GapKind::Time(dist / lead_speed);
             }
         }
     }
     rows
+}
+
+fn raw_crossings(samples: &[(f64, P2)], cl: &CenterlineIndex) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut hint = 0usize;
+    let mut prev_s = 0.0f32;
+    for (i, &(t, p)) in samples.iter().enumerate() {
+        let idx = if i == 0 {
+            cl.nearest_index(p.x, p.y)
+        } else {
+            cl.nearest_index_near(p.x, p.y, hint, 20)
+        };
+        let s = cl.cum[idx];
+        if i > 0 && prev_s > 0.85 * cl.total && s < 0.15 * cl.total {
+            out.push(t);
+        }
+        hint = idx;
+        prev_s = s;
+    }
+    out
+}
+
+/// Last time the car's position changed meaningfully (>5 m from its anchor).
+/// A parked car stops updating this — the retirement signal, computed once.
+fn last_movement_time(samples: &[(f64, P2)]) -> f64 {
+    let mut last = samples.first().map(|(t, _)| *t).unwrap_or(0.0);
+    let mut anchor = samples[0].1;
+    for &(t, p) in samples {
+        if p.dist(anchor) > 5.0 {
+            last = t;
+            anchor = p;
+        }
+    }
+    last
 }

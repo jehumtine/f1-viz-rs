@@ -11,6 +11,7 @@ fn gap_text(gap: &GapKind) -> String {
         GapKind::Leader => "—".to_string(),
         GapKind::Time(t) => format!("+{:.3}", t),
         GapKind::Laps(n) => format!("+{}L", n),
+        GapKind::Retired => "RET".to_string(),
     }
 }
 

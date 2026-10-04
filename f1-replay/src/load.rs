@@ -21,9 +21,7 @@ pub struct SessionBundle {
     pub palette: TeamPalette,
     pub info: SessionInfo,
     pub track: TrackFrame,
-    pub cl: race::CenterlineIndex,
-    pub crossings: HashMap<u8, Vec<f64>>,
-    pub race_start: f64,
+    pub race: race::RaceModel,
 }
 
 pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
@@ -48,7 +46,7 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
             }
         }
     }
-    let crossings = race::build_crossings(&per_driver, &cl);
+    let race = race::RaceModel::build(&per_driver, cl);
     #[cfg(debug_assertions)]
     let _ = std::fs::write("track_debug.svg", track.to_svg());
     let car_data = client.get_car_data().await.context("car data")?;
@@ -65,7 +63,6 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
         .keys()
         .map(|&n| (n, CarTrack::build(n, &positions, &car_data)))
         .collect();
-    let race_start = race::race_start(&laps);
 
     //TODO: make this efficient
     let timeline = Timeline::from_feeds(
@@ -77,6 +74,7 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
         laps.to_vec(),
     );
     let player = SessionPlayer::new(timeline, tracks);
+
     let palette = TeamPalette::from_drivers(&drivers);
 
     Ok(SessionBundle {
@@ -86,8 +84,6 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
         palette,
         info,
         track,
-        cl,
-        crossings,
-        race_start,
+        race,
     })
 }
