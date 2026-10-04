@@ -4,13 +4,18 @@ mod load;
 mod playback;
 mod race;
 mod scene;
+mod session_index;
 mod theme;
+mod transport;
 
+use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use crate::playback::PlaybackClock;
 use crate::scene::mesh::build_ribbon_mesh;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, EguiStartupSet, egui};
@@ -30,6 +35,15 @@ enum AppPhase {
 #[derive(Resource)]
 struct LoadRx(Mutex<Receiver<anyhow::Result<SessionBundle>>>);
 
+#[derive(Resource)]
+struct CurrentSessionPath(String);
+
+#[derive(Component)]
+struct SessionEntity;
+
+#[derive(Resource, Default)]
+struct ReloadRequested(bool);
+
 fn main() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -39,7 +53,7 @@ fn main() {
 
         let _ = tx.send(result);
     });
-
+    let session_index = session_index::SessionIndex::scan();
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
@@ -54,13 +68,22 @@ fn main() {
         .insert_resource(ClearColor(theme::chrome_bevy::ASPHALT))
         .insert_resource(PendingBundle::default())
         .init_state::<AppPhase>()
+        .insert_resource(CurrentSessionPath(SESSION_PATH.to_string()))
+        .insert_resource(session_index)
         .insert_resource(LoadRx(Mutex::new(rx)))
+        .insert_resource(ReloadRequested::default())
         .add_systems(
             PreStartup,
             setup_camera.before(EguiStartupSet::InitContexts),
         )
         .add_systems(Startup, debug_startup)
         .add_systems(Startup, setup_fonts)
+        .add_systems(OnEnter(AppPhase::Loading), on_session_change)
+        .add_systems(OnEnter(AppPhase::Loading), clear_bundle)
+        .add_systems(
+            OnEnter(AppPhase::Loading),
+            (clear_session_entities, clear_bundle, on_session_change),
+        )
         .add_systems(
             Update,
             (poll_load, maybe_enter_running).run_if(in_state(AppPhase::Loading)),
@@ -69,7 +92,7 @@ fn main() {
             EguiPrimaryContextPass,
             (
                 splash.run_if(in_state(AppPhase::Loading)),
-                debug_transport.run_if(in_state(AppPhase::Running)),
+                render_ui.run_if(in_state(AppPhase::Running)),
             ),
         )
         .add_systems(
@@ -115,6 +138,7 @@ fn spawn_cars(
                 mat: mat_handle,
                 last_live: true,
             },
+            SessionEntity,
         ));
     }
 }
@@ -212,6 +236,7 @@ fn spawn_track(
         MeshMaterial2d(mat_handle),
         Transform::default(),
         Name::new("TrackCenterline"),
+        SessionEntity,
     ));
 
     let start_pt = frame.centerline[frame.start_idx];
@@ -224,7 +249,12 @@ fn spawn_track(
         MeshMaterial2d(tick_mat),
         Transform::from_xyz(start_pt.x, start_pt.y, 0.0),
         Name::new("StartFinish"),
+        SessionEntity,
     ));
+}
+
+fn clear_bundle(mut commands: Commands) {
+    commands.remove_resource::<SessionBundle>();
 }
 
 fn fit_camera(
@@ -261,7 +291,9 @@ fn poll_load(rx: Res<LoadRx>, mut pending: ResMut<PendingBundle>) {
     if pending.0.is_none() {
         if let Ok(result) = rx.0.lock().unwrap().try_recv() {
             match result {
-                Ok(bundle) => pending.0 = Some(bundle),
+                Ok(bundle) => {
+                    pending.0 = Some(bundle);
+                }
                 Err(e) => {
                     eprintln!("load failed: {e:?}");
                     std::process::exit(1);
@@ -271,16 +303,44 @@ fn poll_load(rx: Res<LoadRx>, mut pending: ResMut<PendingBundle>) {
     }
 }
 
+fn clear_session_entities(mut commands: Commands, doomed: Query<Entity, With<SessionEntity>>) {
+    for e in doomed.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+fn on_session_change(
+    current_path: Res<CurrentSessionPath>,
+    mut reload: ResMut<ReloadRequested>,
+    mut commands: Commands,
+) {
+    if !reload.0 {
+        return;
+    }
+    reload.0 = false;
+    let path = current_path.0.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = rt.block_on(load::load_bundle(&path));
+        let _ = tx.send(result);
+    });
+    commands.insert_resource(LoadRx(std::sync::Mutex::new(rx)));
+}
+
 fn maybe_enter_running(
     mut pending: ResMut<PendingBundle>,
     time: Res<Time>,
     mut commands: Commands,
     mut next: ResMut<NextState<AppPhase>>,
+    mut clock: ResMut<playback::PlaybackClock>,
 ) {
     if time.elapsed_secs() < MIN_SPLASH_SECS || pending.0.is_none() {
         return;
     }
     if let Some(bundle) = pending.0.take() {
+        clock.t = Duration::from_secs(3600);
+        clock.playing = true;
         commands.insert_resource(bundle);
         next.set(AppPhase::Running);
     }
@@ -333,28 +393,67 @@ struct FpsAcc {
     value: f32,
 }
 
-fn debug_transport(
-    mut contexts: EguiContexts,
-    mut clock: ResMut<playback::PlaybackClock>,
-    mut bundle: Option<ResMut<SessionBundle>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut acc: Local<FpsAcc>,
-) {
-    acc.frames += 1;
-    let now = time.elapsed_secs();
-    if now - acc.window_start >= 1.0 {
-        acc.value = acc.frames as f32 / (now - acc.window_start);
-        acc.frames = 0;
-        acc.window_start = now;
-    }
-    let fps = acc.value;
+#[derive(SystemParam)]
+struct UiState<'w, 's> {
+    clock: ResMut<'w, PlaybackClock>,
+    bundle: Option<ResMut<'w, SessionBundle>>,
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    time: Res<'w, Time>,
+    acc: Local<'s, FpsAcc>,
+    next_state: ResMut<'w, NextState<AppPhase>>,
+    current_path: ResMut<'w, CurrentSessionPath>,
+    session_index: Res<'w, session_index::SessionIndex>,
+    reload: ResMut<'w, ReloadRequested>,
+}
 
-    let (Some(bundle), Ok(ctx)) = (bundle.as_mut(), contexts.ctx_mut()) else {
+fn render_ui(mut contexts: EguiContexts, mut state: UiState) {
+    state.acc.frames += 1;
+    let now = state.time.elapsed_secs();
+    if now - state.acc.window_start >= 1.0 {
+        state.acc.value = state.acc.frames as f32 / (now - state.acc.window_start);
+        state.acc.frames = 0;
+        state.acc.window_start = now;
+    }
+    let fps = state.acc.value;
+
+    let (Some(bundle), Ok(ctx)) = (state.bundle.as_mut(), contexts.ctx_mut()) else {
         return;
     };
     let max_secs = bundle.player.duration().0.as_secs_f32();
-    let frame = bundle.player.frame_at(RawOffset(clock.t));
+    let frame = bundle.player.frame_at(RawOffset(state.clock.t));
+
+    let screen = ctx.viewport_rect();
+    egui::Area::new("session_picker".into())
+        .pivot(egui::Align2::LEFT_TOP)
+        .fixed_pos(egui::pos2(screen.min.x + 14.0, screen.min.y + 14.0))
+        .show(ctx, |ui| {
+            ui.set_width(240.0);
+            crate::theme::glass().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("SESSION")
+                        .font(theme::FontRoles::display(14.0))
+                        .color(theme::chrome::MUTED),
+                );
+                ui.add_space(4.0);
+                egui::ComboBox::from_label("")
+                    .selected_text(bundle.info.session_name.clone())
+                    .show_ui(ui, |ui| {
+                        for entry in &state.session_index.entries {
+                            if ui
+                                .selectable_label(
+                                    state.current_path.0 == entry.path,
+                                    &entry.display,
+                                )
+                                .clicked()
+                            {
+                                state.current_path.0 = entry.path.clone();
+                                state.reload.0 = true;
+                                state.next_state.set(AppPhase::Loading);
+                            }
+                        }
+                    });
+            });
+        });
 
     let mut root_ui = egui::Ui::new(
         ctx.clone(),
@@ -362,46 +461,18 @@ fn debug_transport(
         egui::UiBuilder::new().max_rect(ctx.viewport_rect()),
     );
 
-    // HUD top bar
-    hud::render_hud(&mut root_ui, &bundle.info, &frame, clock.t);
+    hud::render_hud(&mut root_ui, &bundle.info, &frame, state.clock.t);
 
-    let rows = bundle.race.classify(clock.t.as_secs_f64(), &frame.cars);
-
+    let rows = bundle
+        .race
+        .classify(state.clock.t.as_secs_f64(), &frame.cars);
     leaderboard::render_leaderboard(&mut root_ui, &rows, &bundle.drivers, &bundle.palette);
 
-    // Transport bar (existing)
-    egui::Panel::bottom("transport")
-        .frame(egui::Frame::NONE.fill(egui::Color32::from_black_alpha(140)))
-        .show(&mut root_ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button(if clock.playing { "||" } else { ">" }).clicked() {
-                    clock.playing = !clock.playing;
-                }
-                for s in [0.5f32, 1.0, 2.0, 4.0, 8.0] {
-                    if ui
-                        .selectable_label(clock.speed == s, format!("{s}x"))
-                        .clicked()
-                    {
-                        clock.speed = s;
-                    }
-                }
-                let mut secs = clock.t.as_secs_f32();
-                let resp = ui.add(egui::Slider::new(&mut secs, 0.0..=max_secs).show_value(false));
-                if resp.changed() {
-                    clock.t = Duration::from_secs_f32(secs);
-                }
-                ui.monospace(format!(
-                    "{:02}:{:02} / {:02}:{:02}",
-                    secs as u32 / 60,
-                    secs as u32 % 60,
-                    max_secs as u32 / 60,
-                    max_secs as u32 % 60
-                ));
-                ui.monospace(format!("{fps:.0} fps"));
-            });
-        });
-
-    if keys.just_pressed(KeyCode::Space) {
-        clock.playing = !clock.playing;
-    }
+    transport::render_transport(
+        &mut root_ui,
+        &mut state.clock.deref_mut(),
+        max_secs,
+        fps,
+        &state.keys.deref(),
+    );
 }

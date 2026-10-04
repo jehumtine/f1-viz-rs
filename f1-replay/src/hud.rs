@@ -26,62 +26,68 @@ fn format_wall_clock(elapsed: std::time::Duration) -> String {
 
 /// Render the top HUD bar
 pub fn render_hud(ui: &mut Ui, info: &SessionInfo, frame: &Frame, elapsed: std::time::Duration) {
-    // egui 0.36: Panel::top() instead of TopBottomPanel::top()
-    egui::Panel::top("hud_top")
-        .frame(
-            egui::Frame::NONE
-                .fill(chrome::PANEL)
-                .corner_radius(CornerRadius::same(14)), // CornerRadius instead of Rounding
-        )
-        .show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Left: session name + type
-                ui.label(
-                    RichText::new(format!("{} · {}", info.meeting_name, info.session_name))
-                        .font(FontRoles::display(24.0))
-                        .color(chrome::TEXT),
-                );
+    let ctx = ui.ctx().clone();
+    egui::Area::new("hud_top".into())
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 14.0))
+        .show(&ctx, |ui| {
+            crate::theme::glass().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} · {}", info.meeting_name, info.session_name))
+                            .font(FontRoles::display(24.0))
+                            .color(chrome::TEXT),
+                    );
 
-                ui.add_space(ui.available_width() * 0.2);
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(16.0);
 
-                // Center: lap counter (now a tuple (current, total))
-                let (current_lap, total_laps) = frame.state.lap;
-                ui.label(
-                    RichText::new(format!("LAP {}/{}", current_lap, total_laps))
-                        .font(FontRoles::mono(20.0))
-                        .color(chrome::TEXT),
-                );
+                    // Lap counter
+                    let (current_lap, total_laps) = frame.state.lap;
+                    ui.label(
+                        RichText::new(format!("LAP {}/{}", current_lap, total_laps))
+                            .font(FontRoles::mono(20.0))
+                            .color(chrome::TEXT),
+                    );
 
-                ui.add_space(ui.available_width() * 0.3);
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(16.0);
 
-                // Right: track status badge
-                let (status_label, status_color) = track_status_display(frame.state.track_status);
-                ui.label(
-                    RichText::new(status_label)
-                        .color(status_color)
-                        .font(FontRoles::body(14.0)),
-                );
+                    // Track status badge
+                    let (status_label, status_color) =
+                        track_status_display(frame.state.track_status);
+                    ui.label(
+                        RichText::new(status_label)
+                            .color(status_color)
+                            .font(FontRoles::body(14.0)),
+                    );
 
-                ui.separator();
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(16.0);
 
-                // Track temp (directly from state.weather)
-                ui.label(
-                    RichText::new(format!(
-                        "{}°C TRK",
-                        frame.state.weather.unwrap().track_temp_c as u32
-                    ))
-                    .font(FontRoles::mono(14.0))
-                    .color(chrome::MUTED),
-                );
-
-                ui.separator();
-
-                // Session elapsed time (simplified — no wall clock for now)
-                ui.label(
-                    RichText::new(format_wall_clock(elapsed))
+                    // Track temp
+                    ui.label(
+                        RichText::new(format!(
+                            "{}°C TRK",
+                            frame.state.weather.unwrap().track_temp_c as u32
+                        ))
                         .font(FontRoles::mono(14.0))
                         .color(chrome::MUTED),
-                );
+                    );
+
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(16.0);
+
+                    // Session elapsed time
+                    ui.label(
+                        RichText::new(format_wall_clock(elapsed))
+                            .font(FontRoles::mono(14.0))
+                            .color(chrome::MUTED),
+                    );
+                });
             });
         });
 }

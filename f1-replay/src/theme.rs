@@ -62,6 +62,17 @@ impl FontRoles {
     }
 }
 
+pub fn glass() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(chrome::PANEL)
+        .corner_radius(egui::CornerRadius::same(12))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_white_alpha(18), // hairline edge = glass, not 1996
+        ))
+        .inner_margin(egui::Margin::same(10))
+}
+
 pub fn apply_glass(style: &mut Style) {
     style.visuals.dark_mode = true;
     style.visuals.panel_fill = chrome::PANEL;
