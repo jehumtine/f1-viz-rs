@@ -9,5 +9,8 @@ bevy = "0.19.1"
 bevy_egui = "0.42.0"
 chrono = "0.4.45"
 f1-data = { path = "../f1-data" }
+reqwest = { version = "0.11", features = ["json", "native-tls", "gzip", "brotli", "deflate"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 

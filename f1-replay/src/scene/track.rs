@@ -215,7 +215,6 @@ pub fn derive_track_frame(
         .min_by(|(_, a), (_, b)| a.dist(line_pt).partial_cmp(&b.dist(line_pt)).unwrap())
         .map(|(i, _)| i)
         .unwrap_or(0);
-
     println!(
         "[track] centerline {} pts, lap {:.0} m",
         centerline.len(),

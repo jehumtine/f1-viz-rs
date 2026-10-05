@@ -199,6 +199,7 @@ impl RaceModel {
                     progress: self
                         .cl
                         .progress(state.position.x_m as f32, state.position.y_m as f32),
+                    on_track: state.position.on_track,
                     speed_kph: state.telemetry.speed_kph,
                     retired: d.retired_at.is_some_and(|r| t >= r),
                     gap: GapKind::Leader,
@@ -248,6 +249,7 @@ pub struct LeaderRow {
     pub speed_kph: u32,
     pub retired: bool,
     pub gap: GapKind,
+    pub on_track: bool,
 }
 
 pub fn compute_leaderboard(
@@ -274,6 +276,7 @@ pub fn compute_leaderboard(
                     .map(|c| lap_at(c, t, race_start)) // forward it
                     .unwrap_or(1)
                     .min(official_lap),
+                on_track: state.position.on_track,
                 progress,
                 speed_kph: state.telemetry.speed_kph,
                 retired,
@@ -287,6 +290,7 @@ pub fn compute_leaderboard(
         a.retired
             .cmp(&b.retired)
             .then(b.lap.cmp(&a.lap))
+            .then(b.on_track.cmp(&a.on_track))
             .then(b.progress.partial_cmp(&a.progress).unwrap())
     });
 

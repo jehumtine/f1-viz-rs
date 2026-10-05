@@ -8,13 +8,12 @@ mod session_index;
 mod theme;
 mod transport;
 
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::playback::PlaybackClock;
-use crate::scene::mesh::build_ribbon_mesh;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -22,38 +21,42 @@ use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, EguiStartupSet
 use f1_data::RawOffset;
 
 use crate::load::SessionBundle;
-
-const SESSION_PATH: &str = "/2023/2023-07-30_Belgian_Grand_Prix/2023-07-30_Race/";
+use crate::scene::mesh::build_ribbon_mesh;
+use crate::session_index::{IndexChannel, IndexStatus, SessionEntry, SessionIndex, SessionKind};
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 enum AppPhase {
     #[default]
+    Browse,
     Loading,
     Running,
 }
 
 #[derive(Resource)]
-struct LoadRx(Mutex<Receiver<anyhow::Result<SessionBundle>>>);
+struct LoadRx(Mutex<mpsc::Receiver<anyhow::Result<SessionBundle>>>);
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 struct CurrentSessionPath(String);
 
 #[derive(Component)]
 struct SessionEntity;
 
 #[derive(Resource, Default)]
-struct ReloadRequested(bool);
+struct PendingBundle(Option<SessionBundle>);
+
+const MIN_SPLASH_SECS: f32 = 1.5;
+
+#[derive(Default)]
+struct FpsAcc {
+    frames: u32,
+    window_start: f32,
+    value: f32,
+}
 
 fn main() {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // Start with a dummy load channel; replaced on first real session change.
+    let (_, load_rx) = mpsc::channel::<anyhow::Result<SessionBundle>>();
 
-        let result = rt.block_on(load::load_bundle(SESSION_PATH));
-
-        let _ = tx.send(result);
-    });
-    let session_index = session_index::SessionIndex::scan();
     App::new()
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
@@ -68,18 +71,22 @@ fn main() {
         .insert_resource(ClearColor(theme::chrome_bevy::ASPHALT))
         .insert_resource(PendingBundle::default())
         .init_state::<AppPhase>()
-        .insert_resource(CurrentSessionPath(SESSION_PATH.to_string()))
-        .insert_resource(session_index)
-        .insert_resource(LoadRx(Mutex::new(rx)))
-        .insert_resource(ReloadRequested::default())
+        .insert_resource(CurrentSessionPath::default())
+        .insert_resource(SessionIndex::default())
+        .insert_resource(IndexChannel::default())
+        .insert_resource(LoadRx(Mutex::new(load_rx)))
+        .insert_resource(playback::PlaybackClock::default())
         .add_systems(
             PreStartup,
             setup_camera.before(EguiStartupSet::InitContexts),
         )
-        .add_systems(Startup, debug_startup)
-        .add_systems(Startup, setup_fonts)
-        .add_systems(OnEnter(AppPhase::Loading), on_session_change)
-        .add_systems(OnEnter(AppPhase::Loading), clear_bundle)
+        .add_systems(Startup, (debug_startup, setup_fonts))
+        // Phase transitions
+        .add_systems(
+            OnEnter(AppPhase::Browse),
+            session_index::request_years_on_enter,
+        )
+        .add_systems(Update, session_index::poll_index)
         .add_systems(
             OnEnter(AppPhase::Loading),
             (clear_session_entities, clear_bundle, on_session_change),
@@ -89,29 +96,50 @@ fn main() {
             (poll_load, maybe_enter_running).run_if(in_state(AppPhase::Loading)),
         )
         .add_systems(
+            OnEnter(AppPhase::Running),
+            (announce, spawn_track, spawn_cars, fit_camera),
+        )
+        // UI
+        .add_systems(
             EguiPrimaryContextPass,
             (
+                browse_ui.run_if(in_state(AppPhase::Browse)),
                 splash.run_if(in_state(AppPhase::Loading)),
                 render_ui.run_if(in_state(AppPhase::Running)),
             ),
         )
-        .add_systems(
-            OnEnter(AppPhase::Running),
-            (announce, spawn_track, spawn_cars, fit_camera),
-        )
-        .insert_resource(playback::PlaybackClock::default())
-        .add_systems(
-            Update,
-            (tick_clock, update_cars)
-                .chain()
-                .run_if(in_state(AppPhase::Running)),
-        )
-        .insert_resource(playback::PlaybackClock::starting_at(3600))
+        // Simulation
+        .add_systems(Update, tick_clock)
+        .add_systems(Update, update_cars.run_if(in_state(AppPhase::Running)))
         .run();
 }
 
 fn tick_clock(mut clock: ResMut<playback::PlaybackClock>) {
     clock.tick(Instant::now());
+}
+
+fn debug_startup() {
+    println!("[bevy] Startup reached");
+}
+
+fn setup_fonts(mut contexts: EguiContexts) -> Result {
+    println!("[egui] setup_fonts entered");
+    let ctx = contexts.ctx_mut()?;
+    println!("[egui] got primary context");
+    theme::FontRoles::install(ctx);
+    println!("[egui] fonts installed");
+    Ok(())
+}
+
+fn setup_camera(mut commands: Commands) {
+    commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 100.0)));
+}
+
+#[derive(Component)]
+struct CarMarker {
+    num: u8,
+    mat: Handle<ColorMaterial>,
+    last_live: bool,
 }
 
 fn spawn_cars(
@@ -143,13 +171,6 @@ fn spawn_cars(
     }
 }
 
-#[derive(Component)]
-struct CarMarker {
-    num: u8,
-    mat: Handle<ColorMaterial>,
-    last_live: bool,
-}
-
 fn update_cars(
     clock: Res<playback::PlaybackClock>,
     mut bundle: Option<ResMut<SessionBundle>>,
@@ -179,10 +200,7 @@ fn announce(mut bundle: ResMut<SessionBundle>, clock: Res<playback::PlaybackCloc
         bundle.track.lap_len_m,
     );
 
-    bundle.race.debug_crossings(2);
-    bundle.race.debug_crossings(1);
-
-    let t = 3600.0;
+    let t = clock.t.as_secs_f64();
     let frame = bundle
         .player
         .frame_at(RawOffset(std::time::Duration::from_secs_f64(t)));
@@ -197,38 +215,17 @@ fn announce(mut bundle: ResMut<SessionBundle>, clock: Res<playback::PlaybackCloc
     }
 }
 
-fn setup_fonts(mut contexts: EguiContexts) -> Result {
-    println!("[egui] setup_fonts entered");
-
-    let ctx = contexts.ctx_mut()?;
-
-    println!("[egui] got primary context");
-
-    theme::FontRoles::install(ctx);
-
-    println!("[egui] fonts installed");
-
-    Ok(())
-}
-
-fn setup_camera(mut commands: Commands) {
-    commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 100.0)));
-}
-
 fn spawn_track(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     bundle: Option<Res<SessionBundle>>,
 ) {
-    let Some(bundle) = bundle else {
-        return;
-    };
+    let Some(bundle) = bundle else { return };
     let frame = &bundle.track;
 
     let mesh = build_ribbon_mesh(&frame.centerline, 8.0, true);
     let mesh_handle = meshes.add(mesh);
-
     let mat_handle = materials.add(ColorMaterial::from(theme::chrome_bevy::PANEL));
 
     commands.spawn((
@@ -241,7 +238,6 @@ fn spawn_track(
 
     let start_pt = frame.centerline[frame.start_idx];
     let tick_mesh = meshes.add(Rectangle::new(4.0, 40.0));
-
     let tick_mat = materials.add(ColorMaterial::from(theme::chrome_bevy::MUTED));
 
     commands.spawn((
@@ -251,10 +247,6 @@ fn spawn_track(
         Name::new("StartFinish"),
         SessionEntity,
     ));
-}
-
-fn clear_bundle(mut commands: Commands) {
-    commands.remove_resource::<SessionBundle>();
 }
 
 fn fit_camera(
@@ -282,10 +274,30 @@ fn fit_camera(
         }
     }
 }
-const MIN_SPLASH_SECS: f32 = 1.5;
 
-#[derive(Resource, Default)]
-struct PendingBundle(Option<SessionBundle>);
+fn clear_bundle(mut commands: Commands) {
+    commands.remove_resource::<SessionBundle>();
+}
+
+fn clear_session_entities(mut commands: Commands, doomed: Query<Entity, With<SessionEntity>>) {
+    for e in doomed.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+fn on_session_change(current_path: Res<CurrentSessionPath>, mut commands: Commands) {
+    let path = current_path.0.clone();
+    if path.is_empty() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let result = rt.block_on(load::load_bundle(&path));
+        let _ = tx.send(result);
+    });
+    commands.insert_resource(LoadRx(Mutex::new(rx)));
+}
 
 fn poll_load(rx: Res<LoadRx>, mut pending: ResMut<PendingBundle>) {
     if pending.0.is_none() {
@@ -296,36 +308,12 @@ fn poll_load(rx: Res<LoadRx>, mut pending: ResMut<PendingBundle>) {
                 }
                 Err(e) => {
                     eprintln!("load failed: {e:?}");
-                    std::process::exit(1);
+                    // Don't exit; fall back to Browse so user can try another.
+                    pending.0 = None;
                 }
             }
         }
     }
-}
-
-fn clear_session_entities(mut commands: Commands, doomed: Query<Entity, With<SessionEntity>>) {
-    for e in doomed.iter() {
-        commands.entity(e).despawn();
-    }
-}
-
-fn on_session_change(
-    current_path: Res<CurrentSessionPath>,
-    mut reload: ResMut<ReloadRequested>,
-    mut commands: Commands,
-) {
-    if !reload.0 {
-        return;
-    }
-    reload.0 = false;
-    let path = current_path.0.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let result = rt.block_on(load::load_bundle(&path));
-        let _ = tx.send(result);
-    });
-    commands.insert_resource(LoadRx(std::sync::Mutex::new(rx)));
 }
 
 fn maybe_enter_running(
@@ -339,17 +327,17 @@ fn maybe_enter_running(
         return;
     }
     if let Some(bundle) = pending.0.take() {
+        // Reset clock for the new session.
         clock.t = Duration::from_secs(3600);
         clock.playing = true;
+        clock.speed = 1.0;
         commands.insert_resource(bundle);
         next.set(AppPhase::Running);
     }
 }
 
 fn splash(mut contexts: EguiContexts, time: Res<Time>) {
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
+    let Ok(ctx) = contexts.ctx_mut() else { return };
 
     let mut root_ui = egui::Ui::new(
         ctx.clone(),
@@ -382,31 +370,227 @@ fn splash(mut contexts: EguiContexts, time: Res<Time>) {
         });
 }
 
-fn debug_startup() {
-    println!("[bevy] Startup reached");
+#[derive(SystemParam)]
+struct PickerParams<'w> {
+    index: ResMut<'w, SessionIndex>,
+    channel: Res<'w, IndexChannel>,
+    current: ResMut<'w, CurrentSessionPath>,
+    next: ResMut<'w, NextState<AppPhase>>,
 }
 
-#[derive(Default)]
-struct FpsAcc {
-    frames: u32,
-    window_start: f32,
-    value: f32,
+fn render_picker(ui: &mut egui::Ui, p: &mut PickerParams, expanded: &mut HashSet<u32>, max_h: f32) {
+    match &p.index.years_status {
+        IndexStatus::Idle | IndexStatus::Fetching => {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("contacting archive…")
+                        .font(theme::FontRoles::mono(16.0))
+                        .color(theme::chrome::MUTED),
+                );
+            });
+            ui.add_space(20.0);
+            return;
+        }
+        IndexStatus::Failed(e) => {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("archive unreachable")
+                        .font(theme::FontRoles::display(18.0))
+                        .color(theme::chrome::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(e.clone())
+                        .font(theme::FontRoles::mono(12.0))
+                        .color(theme::chrome::MUTED),
+                );
+            });
+            ui.add_space(20.0);
+            return;
+        }
+        IndexStatus::Ready => {}
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(max_h)
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            let years: Vec<u32> = p.index.years.clone();
+            for year in years {
+                let is_open = expanded.contains(&year);
+                let loaded = p.index.loaded_years.contains(&year);
+                let fetching = p.index.fetching_years.contains(&year);
+
+                // ---- Year row: full-width hoverable bar ----
+                let (label, color) = if fetching {
+                    (format!("…  {year}"), theme::chrome::MUTED)
+                } else if let Some(msg) = p.index.failed_years.get(&year) {
+                    (format!("x  {year}\n     {msg}"), theme::chrome::MUTED)
+                } else if is_open {
+                    (format!("−  {year}"), theme::chrome::AMBER)
+                } else {
+                    (format!("+  {year}"), theme::chrome::TEXT)
+                };
+
+                let available = ui.available_width();
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(available, 34.0), egui::Sense::click());
+                if resp.hovered() && !is_open {
+                    ui.painter().rect_filled(
+                        rect.expand2(egui::vec2(4.0, 0.0)),
+                        6.0,
+                        egui::Color32::from_white_alpha(12),
+                    );
+                }
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    theme::FontRoles::display(20.0),
+                    color,
+                );
+                if resp.clicked() {
+                    if is_open {
+                        expanded.remove(&year);
+                    } else {
+                        expanded.insert(year);
+                        session_index::request_year(&mut p.index, &p.channel.sender, year);
+                    }
+                }
+
+                // ---- Expanded: meetings + session chips ----
+                if is_open && loaded {
+                    let mut groups: Vec<(u32, Vec<SessionEntry>)> = Vec::new();
+                    for e in p.index.entries.iter().filter(|e| e.year == year) {
+                        match groups.last_mut() {
+                            Some((r, v)) if *r == e.round => v.push(e.clone()),
+                            _ => groups.push((e.round, vec![e.clone()])),
+                        }
+                    }
+                    for (_, group) in groups {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new(&group[0].meeting)
+                                    .font(theme::FontRoles::body(16.0))
+                                    .color(theme::chrome::TEXT),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_space(12.0);
+                            for e in &group {
+                                let active = p.current.0 == e.path;
+                                let text = egui::RichText::new(e.kind.label())
+                                    .font(theme::FontRoles::body(14.0))
+                                    .color(if active {
+                                        theme::chrome::AMBER
+                                    } else {
+                                        theme::chrome::MUTED
+                                    });
+                                let desired = ui.spacing().interact_size;
+                                let (rect, resp) = ui.allocate_at_least(
+                                    egui::vec2(56.0, 26.0),
+                                    egui::Sense::click(),
+                                );
+                                let bg = if active {
+                                    egui::Color32::from_rgba_unmultiplied(0xFF, 0xB1, 0x00, 40)
+                                } else if resp.hovered() {
+                                    egui::Color32::from_white_alpha(20)
+                                } else {
+                                    egui::Color32::from_white_alpha(8)
+                                };
+                                ui.painter().rect_filled(rect, 6.0, bg);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    e.kind.label(),
+                                    theme::FontRoles::body(14.0),
+                                    if active {
+                                        theme::chrome::AMBER
+                                    } else if resp.hovered() {
+                                        theme::chrome::TEXT
+                                    } else {
+                                        theme::chrome::MUTED
+                                    },
+                                );
+                                let _ = (text, desired); // silence unused
+                                if resp.clicked() {
+                                    p.current.0 = e.path.clone();
+                                    p.next.set(AppPhase::Loading);
+                                }
+                                ui.add_space(6.0);
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                } else if is_open && fetching {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new("loading meetings…")
+                                .font(theme::FontRoles::mono(13.0))
+                                .color(theme::chrome::MUTED),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+            }
+        });
+}
+
+fn browse_ui(mut contexts: EguiContexts, mut p: PickerParams, mut expanded: Local<HashSet<u32>>) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let screen = ctx.viewport_rect();
+
+    egui::Area::new("browse".into())
+        .pivot(egui::Align2::CENTER_CENTER)
+        .fixed_pos(screen.center())
+        .show(ctx, |ui| {
+            ui.set_width(620.0);
+            theme::glass().show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("F1 REPLAY")
+                            .font(theme::FontRoles::display(48.0))
+                            .color(theme::chrome::TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("select a session to begin")
+                            .font(theme::FontRoles::mono(15.0))
+                            .color(theme::chrome::MUTED),
+                    );
+                });
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(12.0);
+                render_picker(ui, &mut p, &mut expanded, 460.0);
+                ui.add_space(8.0);
+            });
+        });
 }
 
 #[derive(SystemParam)]
 struct UiState<'w, 's> {
-    clock: ResMut<'w, PlaybackClock>,
+    clock: ResMut<'w, playback::PlaybackClock>,
     bundle: Option<ResMut<'w, SessionBundle>>,
     keys: Res<'w, ButtonInput<KeyCode>>,
     time: Res<'w, Time>,
     acc: Local<'s, FpsAcc>,
-    next_state: ResMut<'w, NextState<AppPhase>>,
-    current_path: ResMut<'w, CurrentSessionPath>,
-    session_index: Res<'w, session_index::SessionIndex>,
-    reload: ResMut<'w, ReloadRequested>,
 }
 
-fn render_ui(mut contexts: EguiContexts, mut state: UiState) {
+fn render_ui(
+    mut contexts: EguiContexts,
+    mut state: UiState,
+    mut p: PickerParams,
+    mut picker_open: Local<bool>,
+    mut expanded: Local<HashSet<u32>>,
+) {
     state.acc.frames += 1;
     let now = state.time.elapsed_secs();
     if now - state.acc.window_start >= 1.0 {
@@ -421,39 +605,6 @@ fn render_ui(mut contexts: EguiContexts, mut state: UiState) {
     };
     let max_secs = bundle.player.duration().0.as_secs_f32();
     let frame = bundle.player.frame_at(RawOffset(state.clock.t));
-
-    let screen = ctx.viewport_rect();
-    egui::Area::new("session_picker".into())
-        .pivot(egui::Align2::LEFT_TOP)
-        .fixed_pos(egui::pos2(screen.min.x + 14.0, screen.min.y + 14.0))
-        .show(ctx, |ui| {
-            ui.set_width(240.0);
-            crate::theme::glass().show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("SESSION")
-                        .font(theme::FontRoles::display(14.0))
-                        .color(theme::chrome::MUTED),
-                );
-                ui.add_space(4.0);
-                egui::ComboBox::from_label("")
-                    .selected_text(bundle.info.session_name.clone())
-                    .show_ui(ui, |ui| {
-                        for entry in &state.session_index.entries {
-                            if ui
-                                .selectable_label(
-                                    state.current_path.0 == entry.path,
-                                    &entry.display,
-                                )
-                                .clicked()
-                            {
-                                state.current_path.0 = entry.path.clone();
-                                state.reload.0 = true;
-                                state.next_state.set(AppPhase::Loading);
-                            }
-                        }
-                    });
-            });
-        });
 
     let mut root_ui = egui::Ui::new(
         ctx.clone(),
@@ -475,4 +626,62 @@ fn render_ui(mut contexts: EguiContexts, mut state: UiState) {
         fps,
         &state.keys.deref(),
     );
+
+    // Toggleable picker: a small chip top-left to open, the card when open.
+    let screen = ctx.viewport_rect();
+    if !*picker_open {
+        egui::Area::new("picker_chip".into())
+            .pivot(egui::Align2::LEFT_TOP)
+            .fixed_pos(egui::pos2(screen.min.x + 14.0, screen.min.y + 14.0))
+            .show(ctx, |ui| {
+                theme::glass().show(ui, |ui| {
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new("SESSIONS")
+                                    .font(theme::FontRoles::display(12.0))
+                                    .color(theme::chrome::MUTED),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        *picker_open = true;
+                    }
+                });
+            });
+    } else {
+        egui::Area::new("picker_panel".into())
+            .pivot(egui::Align2::LEFT_TOP)
+            .fixed_pos(egui::pos2(screen.min.x + 14.0, screen.min.y + 14.0))
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                theme::glass().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("SESSIONS")
+                                .font(theme::FontRoles::display(14.0))
+                                .color(theme::chrome::AMBER),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new("✕")
+                                            .font(theme::FontRoles::body(14.0))
+                                            .color(theme::chrome::MUTED),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .clicked()
+                            {
+                                *picker_open = false;
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    render_picker(ui, &mut p, &mut expanded, 380.0);
+                });
+            });
+    }
 }

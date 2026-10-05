@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use bevy::ecs::resource::Resource;
+use bevy::prelude::info;
 use f1_data::api::client::F1ArchiveClient;
 use f1_data::engine::clock::SessionClock;
 use f1_data::engine::player::SessionPlayer;
@@ -26,6 +27,7 @@ pub struct SessionBundle {
 
 pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
     let client = F1ArchiveClient::new(session_path.to_string());
+    println!("we are here! this is the session_path {:?}", session_path);
 
     let drivers = client.get_driver_list().await.context("driver list")?;
     let info = client.get_session_data().await.context("session info")?;
@@ -33,17 +35,42 @@ pub async fn load_bundle(session_path: &str) -> anyhow::Result<SessionBundle> {
     let laps = client.get_lap_count().await.context("lap count")?; // moved up
 
     let track = derive_track_frame(&positions, &laps).context("track derivation")?;
+    let xs: Vec<f32> = track.centerline.iter().map(|p| p.x).collect();
+    let ys: Vec<f32> = track.centerline.iter().map(|p| p.y).collect();
+    info!(
+        "[track-diag] bbox x[{:.0},{:.0}] y[{:.0},{:.0}] lap {:.0} m pts {}",
+        xs.iter().fold(f32::INFINITY, |a, &b| a.min(b)),
+        xs.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
+        ys.iter().fold(f32::INFINITY, |a, &b| a.min(b)),
+        ys.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)),
+        track.lap_len_m,
+        track.centerline.len(),
+    );
+    if track.lap_len_m < 100.0 {
+        anyhow::bail!(
+            "degenerate track (lap {:.0} m): position feed for this session didn't parse — \
+         likely a schema change, check raw Position stream",
+            track.lap_len_m
+        );
+    }
     let cl = race::CenterlineIndex::build(&track.centerline);
     let mut per_driver: HashMap<u8, Vec<(f64, P2)>> = HashMap::new();
+    let mut last: HashMap<u8, (f64, P2)> = HashMap::new();
     for s in &positions {
         let t = s.offset.0.as_secs_f64();
         for (&num, p) in &s.cars {
-            if p.on_track {
-                per_driver
-                    .entry(num)
-                    .or_default()
-                    .push((t, P2::new(p.x_m as f32, p.y_m as f32)));
+            if !p.on_track {
+                continue;
             }
+            let pt = P2::new(p.x_m as f32, p.y_m as f32);
+            if let Some((lt, lp)) = last.get(&num) {
+                let dt = t - *lt;
+                if dt > 0.01 && lp.dist(pt) / dt as f32 > 120.0 {
+                    continue;
+                }
+            }
+            last.insert(num, (t, pt));
+            per_driver.entry(num).or_default().push((t, pt));
         }
     }
     let race = race::RaceModel::build(&per_driver, cl);
