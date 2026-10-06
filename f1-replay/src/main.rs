@@ -5,6 +5,7 @@ mod playback;
 mod race;
 mod scene;
 mod session_index;
+mod telemetry;
 mod theme;
 mod transport;
 
@@ -76,6 +77,7 @@ fn main() {
         .insert_resource(IndexChannel::default())
         .insert_resource(LoadRx(Mutex::new(load_rx)))
         .insert_resource(playback::PlaybackClock::default())
+        .insert_resource(telemetry::TelemetrySelection::default())
         .add_systems(
             PreStartup,
             setup_camera.before(EguiStartupSet::InitContexts),
@@ -582,6 +584,7 @@ struct UiState<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
     time: Res<'w, Time>,
     acc: Local<'s, FpsAcc>,
+    telemetry_sel: ResMut<'w, telemetry::TelemetrySelection>,
 }
 
 fn render_ui(
@@ -617,7 +620,20 @@ fn render_ui(
     let rows = bundle
         .race
         .classify(state.clock.t.as_secs_f64(), &frame.cars);
-    leaderboard::render_leaderboard(&mut root_ui, &rows, &bundle.drivers, &bundle.palette);
+    leaderboard::render_leaderboard(
+        &mut root_ui,
+        &rows,
+        &bundle.drivers,
+        &bundle.palette,
+        state.telemetry_sel.deref_mut(),
+    );
+    telemetry::render_panel(
+        ctx,
+        &frame.cars,
+        &bundle.drivers,
+        &bundle.palette,
+        &state.telemetry_sel.deref_mut(),
+    );
 
     transport::render_transport(
         &mut root_ui,
