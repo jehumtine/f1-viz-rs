@@ -1,6 +1,7 @@
 mod hud;
 mod leaderboard;
 mod load;
+mod overlay;
 mod playback;
 mod race;
 mod scene;
@@ -16,8 +17,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use bevy::ecs::system::SystemParam;
+use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use bevy_egui::input::EguiWantsInput;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, EguiStartupSet, egui};
 use f1_data::RawOffset;
 
@@ -78,6 +81,7 @@ fn main() {
         .insert_resource(LoadRx(Mutex::new(load_rx)))
         .insert_resource(playback::PlaybackClock::default())
         .insert_resource(telemetry::TelemetrySelection::default())
+        .insert_resource(CameraRig::default())
         .add_systems(
             PreStartup,
             setup_camera.before(EguiStartupSet::InitContexts),
@@ -111,8 +115,12 @@ fn main() {
             ),
         )
         // Simulation
-        .add_systems(Update, tick_clock)
-        .add_systems(Update, update_cars.run_if(in_state(AppPhase::Running)))
+        .add_systems(
+            Update,
+            (tick_clock, update_cars, highlight_cars, camera_control)
+                .chain()
+                .run_if(in_state(AppPhase::Running)),
+        )
         .run();
 }
 
@@ -255,6 +263,7 @@ fn fit_camera(
     bundle: Option<Res<SessionBundle>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut query: Query<(&mut Transform, &mut Projection), With<Camera>>,
+    mut rig: ResMut<CameraRig>,
 ) {
     let (Some(bundle), Ok(window)) = (bundle, windows.single()) else {
         return;
@@ -262,15 +271,16 @@ fn fit_camera(
     let frame = &bundle.track;
 
     let size = frame.size();
-    let scale_x = size.x / window.width();
-    let scale_y = size.y / window.height();
-    let scale = scale_x.max(scale_y) / 0.92;
+    let scale = (size.x / window.width()).max(size.y / window.height()) / 0.92;
+
+    rig.fit_scale = scale;
+    rig.center = Vec2::new(frame.center().x, frame.center().y);
+    rig.follow = None;
 
     for (mut transform, mut proj) in query.iter_mut() {
-        transform.translation.x = frame.center().x;
-        transform.translation.y = frame.center().y;
+        transform.translation.x = rig.center.x;
+        transform.translation.y = rig.center.y;
         transform.translation.z = 100.0;
-
         if let Projection::Orthographic(ortho) = proj.as_mut() {
             ortho.scale = scale;
         }
@@ -585,6 +595,7 @@ struct UiState<'w, 's> {
     time: Res<'w, Time>,
     acc: Local<'s, FpsAcc>,
     telemetry_sel: ResMut<'w, telemetry::TelemetrySelection>,
+    cam: Query<'w, 's, (&'static Transform, &'static Projection), With<Camera2d>>, // NEW
 }
 
 fn render_ui(
@@ -614,6 +625,20 @@ fn render_ui(
         "main_ui".into(),
         egui::UiBuilder::new().max_rect(ctx.viewport_rect()),
     );
+    if let Ok((cam_t, proj)) = state.cam.single() {
+        if let Projection::Orthographic(ortho) = proj {
+            let cam = cam_t.translation.truncate();
+            overlay::render_car_labels(
+                ctx,
+                ctx.viewport_rect(),
+                egui::vec2(cam.x, cam.y),
+                ortho.scale,
+                &frame.cars,
+                &bundle.drivers,
+                &state.telemetry_sel.deref_mut(),
+            );
+        }
+    }
 
     hud::render_hud(&mut root_ui, &bundle.info, &frame, state.clock.t);
 
@@ -699,5 +724,139 @@ fn render_ui(
                     render_picker(ui, &mut p, &mut expanded, 380.0);
                 });
             });
+    }
+}
+
+fn highlight_cars(
+    sel: Res<telemetry::TelemetrySelection>,
+    mut q: Query<(&CarMarker, &mut Transform)>,
+) {
+    for (m, mut t) in q.iter_mut() {
+        t.scale = Vec3::splat(if sel.0.contains(&m.num) { 1.6 } else { 1.0 });
+    }
+}
+
+#[derive(Resource, Default)]
+struct CameraRig {
+    follow: Option<u8>,
+    fit_scale: f32,
+    center: Vec2,
+}
+
+#[derive(Default)]
+struct MouseTrack {
+    down: bool,
+    moved: bool,
+    last: Vec2,
+    origin: Vec2,
+}
+
+fn camera_control(
+    wants_input: Res<EguiWantsInput>,
+    mut rig: ResMut<CameraRig>,
+    mut wheel: MessageReader<MouseWheel>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cam: Query<(&mut Transform, &mut Projection), (With<Camera2d>, Without<CarMarker>)>,
+    car_xforms: Query<(&CarMarker, &Transform), Without<Camera2d>>,
+    mut mt: Local<MouseTrack>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let egui_wants = wants_input.wants_any_pointer_input();
+
+    let Ok((mut xform, mut proj)) = cam.single_mut() else {
+        return;
+    };
+    let Projection::Orthographic(ortho) = proj.as_mut() else {
+        return;
+    };
+    let scale = ortho.scale;
+    let center_px = Vec2::new(window.width() / 2.0, window.height() / 2.0);
+    let cursor = window.cursor_position().map(|c| Vec2::new(c.x, c.y));
+
+    // ---- wheel: zoom to cursor ----
+    let mut dy = 0.0;
+    for ev in wheel.read() {
+        dy += ev.y;
+    }
+    if dy != 0.0 && !egui_wants {
+        let factor = 1.1f32.powf(-dy);
+        let new_scale = (scale * factor).clamp(rig.fit_scale * 0.1, rig.fit_scale * 15.0);
+        if let Some(c) = cursor {
+            let cursor_world =
+                xform.translation.truncate() + (c - center_px) * Vec2::new(scale, -scale);
+            let k = new_scale / scale;
+            xform.translation.x = cursor_world.x - (cursor_world.x - xform.translation.x) * k;
+            xform.translation.y = cursor_world.y - (cursor_world.y - xform.translation.y) * k;
+        }
+        ortho.scale = new_scale;
+        rig.follow = None;
+    }
+
+    // ---- left button: drag = pan, clean click = follow/unfollow ----
+    if let Some(c) = cursor {
+        if mouse.just_pressed(MouseButton::Left) && !egui_wants {
+            mt.down = true;
+            mt.moved = false;
+            mt.origin = c;
+            mt.last = c;
+        }
+        if mouse.pressed(MouseButton::Left) && mt.down {
+            let delta = c - mt.last;
+            if (c - mt.origin).length() > 5.0 {
+                mt.moved = true;
+            }
+            if mt.moved && !egui_wants {
+                xform.translation.x -= delta.x * scale;
+                xform.translation.y += delta.y * scale;
+                rig.follow = None;
+            }
+            mt.last = c;
+        }
+        if mouse.just_released(MouseButton::Left) {
+            if mt.down && !mt.moved && !egui_wants {
+                let cursor_world =
+                    xform.translation.truncate() + (c - center_px) * Vec2::new(scale, -scale);
+                let hit = car_xforms
+                    .iter()
+                    .filter(|(_, t)| {
+                        (Vec2::new(t.translation.x, t.translation.y) - cursor_world).length()
+                            < 12.0 * scale
+                    })
+                    .min_by(|(_, a), (_, b)| {
+                        let da = (Vec2::new(a.translation.x, a.translation.y) - cursor_world)
+                            .length_squared();
+                        let db = (Vec2::new(b.translation.x, b.translation.y) - cursor_world)
+                            .length_squared();
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .map(|(m, _)| m.num);
+                rig.follow = hit;
+            }
+            mt.down = false;
+        }
+    }
+
+    // ---- keys ----
+    if keys.just_pressed(KeyCode::Escape) {
+        rig.follow = None;
+    }
+    if keys.just_pressed(KeyCode::KeyF) {
+        xform.translation.x = rig.center.x;
+        xform.translation.y = rig.center.y;
+        ortho.scale = rig.fit_scale;
+        rig.follow = None;
+    }
+
+    // ---- follow mode: glide after the car ----
+    if let Some(num) = rig.follow {
+        if let Some((_, t)) = car_xforms.iter().find(|(m, _)| m.num == num) {
+            let target = Vec2::new(t.translation.x, t.translation.y);
+            let a = 1.0 - (-8.0 * time.delta_secs()).exp();
+            xform.translation.x += (target.x - xform.translation.x) * a;
+            xform.translation.y += (target.y - xform.translation.y) * a;
+        }
     }
 }
