@@ -16,8 +16,11 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use bevy::camera::CameraOutputMode;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::input::EguiWantsInput;
@@ -161,12 +164,22 @@ fn setup_fonts(mut contexts: EguiContexts) -> Result {
 }
 
 fn setup_camera(mut commands: Commands) {
-    commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 100.0)));
+    commands.spawn((
+        Camera2d,
+        Transform::from_xyz(0.0, 0.0, 100.0),
+        Tonemapping::None,
+        Bloom {
+            intensity: 0.4,
+            ..default()
+        },
+    ));
 }
 
 #[derive(Component)]
 struct CarMarker {
     num: u8,
+    mat: Handle<ColorMaterial>,
+    base: LinearRgba,
 }
 
 fn spawn_cars(
@@ -174,24 +187,23 @@ fn spawn_cars(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     bundle: Option<Res<SessionBundle>>,
-    sel: Res<telemetry::TelemetrySelection>,
 ) {
     let Some(bundle) = bundle else { return };
     let circle = meshes.add(Circle::new(6.0));
 
     for (&num, _driver) in &bundle.drivers {
         let c = bundle.palette.get(num);
+        let srgb = Color::srgba_u8(c.r(), c.g(), c.b(), c.a());
+        let base = LinearRgba::from(srgb);
         let bevy_color = Color::srgba_u8(c.r(), c.g(), c.b(), c.a());
-        let mat_handle = materials.add(ColorMaterial::from(bevy_color));
-
-        let is_selected = sel.0.contains(&num);
+        let mat = materials.add(ColorMaterial::from(bevy_color));
 
         commands.spawn((
             Mesh2d(circle.clone()),
-            MeshMaterial2d(mat_handle.clone()),
+            MeshMaterial2d(mat.clone()),
             Transform::from_xyz(0.0, 0.0, 1.0),
             Name::new(format!("Car #{num}")),
-            CarMarker { num },
+            CarMarker { num, mat, base },
             SessionEntity,
         ));
     }
@@ -770,9 +782,24 @@ fn render_ui(
 fn highlight_cars(
     sel: Res<telemetry::TelemetrySelection>,
     mut q: Query<(&CarMarker, &mut Transform)>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     for (m, mut t) in q.iter_mut() {
-        t.scale = Vec3::splat(if sel.0.contains(&m.num) { 1.6 } else { 1.0 });
+        let selected = sel.0.contains(&m.num);
+        t.scale = Vec3::splat(if selected { 1.6 } else { 1.0 });
+
+        if let Some(mut mat) = materials.get_mut(&m.mat) {
+            mat.color = if selected {
+                Color::LinearRgba(LinearRgba::new(
+                    m.base.red * 2.5,
+                    m.base.green * 2.5,
+                    m.base.blue * 2.5,
+                    1.0,
+                ))
+            } else {
+                Color::LinearRgba(m.base)
+            };
+        }
     }
 }
 
