@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy_egui::egui::{self, Color32, CornerRadius, RichText, Ui};
+use bevy_egui::egui::{self, Color32, RichText, Ui};
 
 use crate::theme::{FontRoles, chrome};
 use f1_data::engine::player::Frame;

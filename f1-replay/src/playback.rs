@@ -32,10 +32,4 @@ impl PlaybackClock {
         self.last_wall = Some(now);
         RawOffset(self.t)
     }
-    pub fn starting_at(secs: u64) -> Self {
-        Self {
-            t: Duration::from_secs(secs),
-            ..Default::default()
-        }
-    }
 }

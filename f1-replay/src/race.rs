@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use f1_data::RawOffset;
 use f1_data::engine::track::UnifiedCarState;
 
 use crate::scene::track::P2;
@@ -60,15 +59,6 @@ impl CenterlineIndex {
     pub fn progress(&self, x: f32, y: f32) -> f32 {
         self.cum[self.nearest_index(x, y)]
     }
-}
-
-pub fn race_start(lap_events: &[(RawOffset, u32, Option<u32>)]) -> f64 {
-    lap_events
-        .iter()
-        .find(|(_, cur, _)| *cur == 1)
-        .map(|(at, _, _)| at.0.as_secs_f64())
-        .or_else(|| lap_events.first().map(|(at, _, _)| at.0.as_secs_f64()))
-        .unwrap_or(0.0)
 }
 
 pub fn lap_at(crossings: &[f64], t: f64, race_start: f64) -> u32 {
@@ -166,26 +156,6 @@ impl RaceModel {
         }
     }
 
-    pub fn debug_crossings(&self, driver_num: u8) {
-        if let Some(d) = self.drivers.iter().find(|d| d.num == driver_num) {
-            eprintln!(
-                "[race] Driver #{} crossings (race_start={:.1}s):",
-                driver_num, self.race_start
-            );
-            for (i, &c) in d.crossings.iter().enumerate() {
-                eprintln!(
-                    "  crossing {}: t={:.1}s (race_start + {:.1}s)",
-                    i + 1,
-                    c,
-                    c - self.race_start
-                );
-            }
-            if let Some(ret) = d.retired_at {
-                eprintln!("  retired_at: {:.1}s", ret);
-            }
-        }
-    }
-
     /// The entire per-frame path. No heuristics, no thresholds, no new params ever.
     pub fn classify(&self, t: f64, cars: &HashMap<u8, UnifiedCarState>) -> Vec<LeaderRow> {
         let mut rows: Vec<LeaderRow> = self
@@ -250,67 +220,6 @@ pub struct LeaderRow {
     pub retired: bool,
     pub gap: GapKind,
     pub on_track: bool,
-}
-
-pub fn compute_leaderboard(
-    cars: &HashMap<u8, UnifiedCarState>,
-    cl: &CenterlineIndex,
-    crossings: &HashMap<u8, Vec<f64>>,
-    t: f64,
-    race_start: f64,
-    official_lap: u32,
-    data_end: HashMap<u8, f64>,
-) -> Vec<LeaderRow> {
-    let mut rows: Vec<LeaderRow> = cars
-        .iter()
-        .map(|(&num, state)| {
-            let progress = {
-                let p = cl.progress(state.position.x_m as f32, state.position.y_m as f32);
-                if p.is_finite() { p } else { 0.0 }
-            };
-            let retired = t > data_end.get(&num).copied().unwrap_or(f64::INFINITY) + 60.0;
-            LeaderRow {
-                num,
-                lap: crossings
-                    .get(&num)
-                    .map(|c| lap_at(c, t, race_start)) // forward it
-                    .unwrap_or(1)
-                    .min(official_lap),
-                on_track: state.position.on_track,
-                progress,
-                speed_kph: state.telemetry.speed_kph,
-                retired,
-                gap: GapKind::Leader,
-            }
-        })
-        .collect();
-
-    // Race order: higher lap first, then further along the lap.
-    rows.sort_by(|a, b| {
-        a.retired
-            .cmp(&b.retired)
-            .then(b.lap.cmp(&a.lap))
-            .then(b.on_track.cmp(&a.on_track))
-            .then(b.progress.partial_cmp(&a.progress).unwrap())
-    });
-
-    let pre_race = t < race_start;
-    if let Some(lead) = rows.first().cloned() {
-        let lead_speed = (lead.speed_kph as f32 / 3.6).max(20.0);
-        for (i, row) in rows.iter_mut().enumerate() {
-            if row.retired {
-                row.gap = GapKind::Retired;
-            } else if i == 0 || pre_race {
-                row.gap = GapKind::Leader; // pre-race: order only, no fake gaps
-            } else if row.lap < lead.lap {
-                row.gap = GapKind::Laps(lead.lap - row.lap);
-            } else {
-                let dist = (lead.progress - row.progress).rem_euclid(cl.total);
-                row.gap = GapKind::Time(dist / lead_speed);
-            }
-        }
-    }
-    rows
 }
 
 fn raw_crossings(samples: &[(f64, P2)], cl: &CenterlineIndex) -> Vec<f64> {

@@ -26,7 +26,7 @@ use f1_data::RawOffset;
 
 use crate::load::SessionBundle;
 use crate::scene::mesh::build_ribbon_mesh;
-use crate::session_index::{IndexChannel, IndexStatus, SessionEntry, SessionIndex, SessionKind};
+use crate::session_index::{IndexChannel, IndexStatus, SessionEntry, SessionIndex};
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 enum AppPhase {
@@ -57,6 +57,19 @@ struct FpsAcc {
     value: f32,
 }
 
+#[derive(Resource)]
+struct CameraTarget {
+    position: Vec2,
+    scale: f32,
+}
+
+#[derive(Resource, Default)]
+struct FlagCrossfade {
+    previous: Option<String>,
+    alpha: f32,
+    duration: f32,
+}
+
 fn main() {
     // Start with a dummy load channel; replaced on first real session change.
     let (_, load_rx) = mpsc::channel::<anyhow::Result<SessionBundle>>();
@@ -82,6 +95,12 @@ fn main() {
         .insert_resource(playback::PlaybackClock::default())
         .insert_resource(telemetry::TelemetrySelection::default())
         .insert_resource(CameraRig::default())
+        .insert_resource(overlay::TrailState::default())
+        .insert_resource(CameraTarget {
+            position: Vec2::ZERO,
+            scale: 1.0,
+        })
+        .insert_resource(FlagCrossfade::default())
         .add_systems(
             PreStartup,
             setup_camera.before(EguiStartupSet::InitContexts),
@@ -148,8 +167,6 @@ fn setup_camera(mut commands: Commands) {
 #[derive(Component)]
 struct CarMarker {
     num: u8,
-    mat: Handle<ColorMaterial>,
-    last_live: bool,
 }
 
 fn spawn_cars(
@@ -157,6 +174,7 @@ fn spawn_cars(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     bundle: Option<Res<SessionBundle>>,
+    sel: Res<telemetry::TelemetrySelection>,
 ) {
     let Some(bundle) = bundle else { return };
     let circle = meshes.add(Circle::new(6.0));
@@ -166,16 +184,14 @@ fn spawn_cars(
         let bevy_color = Color::srgba_u8(c.r(), c.g(), c.b(), c.a());
         let mat_handle = materials.add(ColorMaterial::from(bevy_color));
 
+        let is_selected = sel.0.contains(&num);
+
         commands.spawn((
             Mesh2d(circle.clone()),
             MeshMaterial2d(mat_handle.clone()),
             Transform::from_xyz(0.0, 0.0, 1.0),
             Name::new(format!("Car #{num}")),
-            CarMarker {
-                num,
-                mat: mat_handle,
-                last_live: true,
-            },
+            CarMarker { num },
             SessionEntity,
         ));
     }
@@ -334,6 +350,7 @@ fn maybe_enter_running(
     mut commands: Commands,
     mut next: ResMut<NextState<AppPhase>>,
     mut clock: ResMut<playback::PlaybackClock>,
+    mut trails: ResMut<overlay::TrailState>,
 ) {
     if time.elapsed_secs() < MIN_SPLASH_SECS || pending.0.is_none() {
         return;
@@ -345,6 +362,7 @@ fn maybe_enter_running(
         clock.speed = 1.0;
         commands.insert_resource(bundle);
         next.set(AppPhase::Running);
+        trails.trails.clear();
     }
 }
 
@@ -595,7 +613,8 @@ struct UiState<'w, 's> {
     time: Res<'w, Time>,
     acc: Local<'s, FpsAcc>,
     telemetry_sel: ResMut<'w, telemetry::TelemetrySelection>,
-    cam: Query<'w, 's, (&'static Transform, &'static Projection), With<Camera2d>>, // NEW
+    cam: Query<'w, 's, (&'static Transform, &'static Projection), With<Camera2d>>,
+    trails: ResMut<'w, overlay::TrailState>,
 }
 
 fn render_ui(
@@ -619,6 +638,17 @@ fn render_ui(
     };
     let max_secs = bundle.player.duration().0.as_secs_f32();
     let frame = bundle.player.frame_at(RawOffset(state.clock.t));
+    let rows = bundle
+        .race
+        .classify(state.clock.t.as_secs_f64(), &frame.cars);
+
+    let mut trail_nums: Vec<u8> = state.telemetry_sel.0.clone();
+    if let Some(r) = rows.first() {
+        if !trail_nums.contains(&r.num) {
+            trail_nums.push(r.num);
+        }
+    }
+    overlay::update_trails(&mut state.trails.deref_mut(), &trail_nums, &frame.cars);
 
     let mut root_ui = egui::Ui::new(
         ctx.clone(),
@@ -628,9 +658,19 @@ fn render_ui(
     if let Ok((cam_t, proj)) = state.cam.single() {
         if let Projection::Orthographic(ortho) = proj {
             let cam = cam_t.translation.truncate();
+            let screen = ctx.viewport_rect();
+            overlay::render_trails(
+                ctx,
+                screen,
+                egui::vec2(cam.x, cam.y),
+                ortho.scale,
+                &state.trails.deref_mut(),
+                &bundle.palette,
+            );
+
             overlay::render_car_labels(
                 ctx,
-                ctx.viewport_rect(),
+                screen,
                 egui::vec2(cam.x, cam.y),
                 ortho.scale,
                 &frame.cars,

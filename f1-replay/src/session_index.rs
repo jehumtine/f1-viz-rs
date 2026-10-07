@@ -14,16 +14,6 @@ pub enum SessionKind {
 }
 
 impl SessionKind {
-    pub fn folder(self) -> &'static str {
-        match self {
-            SessionKind::Practice1 => "Practice_1",
-            SessionKind::Practice2 => "Practice_2",
-            SessionKind::Practice3 => "Practice_3",
-            SessionKind::Sprint => "Sprint",
-            SessionKind::Qualifying => "Qualifying",
-            SessionKind::Race => "Race",
-        }
-    }
     pub fn label(self) -> &'static str {
         match self {
             SessionKind::Practice1 => "FP1",
