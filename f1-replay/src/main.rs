@@ -16,7 +16,6 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use bevy::camera::CameraOutputMode;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseWheel;
@@ -60,6 +59,15 @@ struct FpsAcc {
     value: f32,
 }
 
+#[derive(Resource, Default)]
+struct TrackReveal {
+    started_at: Option<f32>,
+    done: bool,
+}
+
+#[derive(Component)]
+struct TrackRibbon;
+
 #[derive(Resource)]
 struct CameraTarget {
     position: Vec2,
@@ -99,6 +107,7 @@ fn main() {
         .insert_resource(telemetry::TelemetrySelection::default())
         .insert_resource(CameraRig::default())
         .insert_resource(overlay::TrailState::default())
+        .insert_resource(TrackReveal::default())
         .insert_resource(CameraTarget {
             position: Vec2::ZERO,
             scale: 1.0,
@@ -125,7 +134,7 @@ fn main() {
         )
         .add_systems(
             OnEnter(AppPhase::Running),
-            (announce, spawn_track, spawn_cars, fit_camera),
+            (announce, spawn_track, spawn_cars, fit_camera, begin_reveal),
         )
         // UI
         .add_systems(
@@ -139,7 +148,13 @@ fn main() {
         // Simulation
         .add_systems(
             Update,
-            (tick_clock, update_cars, highlight_cars, camera_control)
+            (
+                tick_clock,
+                update_cars,
+                highlight_cars,
+                track_reveal,
+                camera_control,
+            )
                 .chain()
                 .run_if(in_state(AppPhase::Running)),
         )
@@ -152,6 +167,69 @@ fn tick_clock(mut clock: ResMut<playback::PlaybackClock>) {
 
 fn debug_startup() {
     println!("[bevy] Startup reached");
+}
+
+fn begin_reveal(mut reveal: ResMut<TrackReveal>, time: Res<Time>) {
+    reveal.started_at = Some(time.elapsed_secs());
+    reveal.done = false;
+}
+
+fn track_reveal(
+    mut reveal: ResMut<TrackReveal>,
+    time: Res<Time>,
+    bundle: Option<Res<SessionBundle>>,
+    rig: Res<CameraRig>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    ribbon: Query<&Mesh2d, With<TrackRibbon>>,
+    mut cam: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
+) {
+    if reveal.done {
+        return;
+    }
+    let Some(bundle) = bundle else { return };
+    let Some(mesh2d) = ribbon.iter().next() else {
+        return;
+    };
+    let Some((mut xf, mut proj)) = cam.iter_mut().next() else {
+        return;
+    };
+    let Some(start) = reveal.started_at else {
+        return;
+    };
+
+    let t = ((time.elapsed_secs() - start) / 4.0).clamp(0.0, 1.0);
+    let e = 1.0 - (1.0 - t).powi(4); // cubic ease-out
+
+    // Progressive ribbon: first count points, open until complete
+    let cl = &bundle.track.centerline;
+    let count = (e * cl.len() as f32) as usize;
+    if count >= 2 {
+        let closed = count >= cl.len();
+        let mesh = build_ribbon_mesh(&cl[..count], 8.0, closed);
+        if let Some(mut m) = meshes.get_mut(&mesh2d.0) {
+            *m = mesh;
+        }
+    }
+
+    // Camera: tight on pole position → pull back to full fit
+    let start_pt = cl[bundle.track.start_idx];
+    let zoom = rig.fit_scale * 0.15;
+    let scale = zoom + (rig.fit_scale - zoom) * e;
+    xf.translation.x = start_pt.x + (rig.center.x - start_pt.x) * e;
+    xf.translation.y = start_pt.y + (rig.center.y - start_pt.y) * e;
+    if let Projection::Orthographic(o) = proj.as_mut() {
+        o.scale = scale;
+    }
+
+    if t >= 1.0 {
+        // Land exactly on the fit so camera_control takes over seamlessly
+        xf.translation.x = rig.center.x;
+        xf.translation.y = rig.center.y;
+        if let Projection::Orthographic(o) = proj.as_mut() {
+            o.scale = rig.fit_scale;
+        }
+        reveal.done = true;
+    }
 }
 
 fn setup_fonts(mut contexts: EguiContexts) -> Result {
@@ -271,6 +349,7 @@ fn spawn_track(
         MeshMaterial2d(mat_handle),
         Transform::default(),
         Name::new("TrackCenterline"),
+        TrackRibbon,
         SessionEntity,
     ));
 
@@ -829,7 +908,11 @@ fn camera_control(
     mut cam: Query<(&mut Transform, &mut Projection), (With<Camera2d>, Without<CarMarker>)>,
     car_xforms: Query<(&CarMarker, &Transform), Without<Camera2d>>,
     mut mt: Local<MouseTrack>,
+    reveal: Res<TrackReveal>,
 ) {
+    if !reveal.done {
+        return;
+    }
     let Ok(window) = windows.single() else { return };
     let egui_wants = wants_input.wants_any_pointer_input();
 
