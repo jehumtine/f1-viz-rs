@@ -1,3 +1,4 @@
+mod digit_roll;
 mod hud;
 mod leaderboard;
 mod load;
@@ -26,6 +27,7 @@ use bevy_egui::input::EguiWantsInput;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, EguiStartupSet, egui};
 use f1_data::RawOffset;
 
+use crate::digit_roll::DigitRollState;
 use crate::load::SessionBundle;
 use crate::scene::mesh::build_ribbon_mesh;
 use crate::session_index::{IndexChannel, IndexStatus, SessionEntry, SessionIndex};
@@ -108,6 +110,7 @@ fn main() {
         .insert_resource(CameraRig::default())
         .insert_resource(overlay::TrailState::default())
         .insert_resource(TrackReveal::default())
+        .insert_resource(DigitRollState::default())
         .insert_resource(CameraTarget {
             position: Vec2::ZERO,
             scale: 1.0,
@@ -706,6 +709,7 @@ struct UiState<'w, 's> {
     telemetry_sel: ResMut<'w, telemetry::TelemetrySelection>,
     cam: Query<'w, 's, (&'static Transform, &'static Projection), With<Camera2d>>,
     trails: ResMut<'w, overlay::TrailState>,
+    digit_state: ResMut<'w, DigitRollState>,
 }
 
 fn render_ui(
@@ -776,12 +780,22 @@ fn render_ui(
     let rows = bundle
         .race
         .classify(state.clock.t.as_secs_f64(), &frame.cars);
+    let gap_rows: Vec<(u8, String)> = rows
+        .iter()
+        .map(|r| (r.num, crate::leaderboard::gap_text(&r.gap)))
+        .collect();
+    state
+        .digit_state
+        .deref_mut()
+        .update(&gap_rows, state.time.delta_secs());
+
     leaderboard::render_leaderboard(
         &mut root_ui,
         &rows,
         &bundle.drivers,
         &bundle.palette,
         state.telemetry_sel.deref_mut(),
+        state.digit_state.deref_mut(),
     );
     telemetry::render_panel(
         ctx,

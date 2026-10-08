@@ -1,3 +1,4 @@
+use crate::digit_roll::DigitRollState;
 use std::collections::HashMap;
 
 use bevy_egui::egui::{self, Align2, Color32, Pos2, Rect, RichText, Ui, Vec2};
@@ -6,7 +7,7 @@ use crate::race::{GapKind, LeaderRow};
 use crate::theme::{FontRoles, TeamPalette, chrome};
 use f1_data::model::domain::Driver;
 
-fn gap_text(gap: &GapKind) -> String {
+pub fn gap_text(gap: &GapKind) -> String {
     match gap {
         GapKind::Leader => "—".to_string(),
         GapKind::Time(t) => format!("+{:.3}", t),
@@ -21,6 +22,7 @@ pub fn render_leaderboard(
     drivers: &HashMap<u8, Driver>,
     palette: &TeamPalette,
     selection: &mut crate::telemetry::TelemetrySelection,
+    digit_state: &mut DigitRollState,
 ) {
     let ctx = ui.ctx().clone();
     egui::Area::new("leaderboard".into())
@@ -55,7 +57,6 @@ pub fn render_leaderboard(
                     let team_color = palette.get(row.num);
                     let selected = selection.0.contains(&row.num);
 
-                    // One full-width click target per row (same pattern as picker rows)
                     let (rect, resp) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), 20.0),
                         egui::Sense::click(),
@@ -76,14 +77,18 @@ pub fn render_leaderboard(
                     }
 
                     let cy = rect.center().y;
-                    // position
+
+                    // position (animated when ranks swap)
+                    let pos_text = format!("{}", i + 1);
+                    let (_, _, _) = digit_state.snapshot(row.num); // consumed via per-row map below
                     ui.painter().text(
                         Pos2::new(rect.left() + 20.0, cy),
                         Align2::RIGHT_CENTER,
-                        format!("{}", i + 1),
+                        pos_text,
                         FontRoles::mono(13.0),
                         chrome::MUTED,
                     );
+
                     // team accent
                     ui.painter().rect_filled(
                         Rect::from_min_size(
@@ -93,6 +98,7 @@ pub fn render_leaderboard(
                         1.0,
                         team_color,
                     );
+
                     // code
                     ui.painter().text(
                         Pos2::new(rect.left() + 40.0, cy),
@@ -101,14 +107,22 @@ pub fn render_leaderboard(
                         FontRoles::body(13.0),
                         if selected { team_color } else { chrome::TEXT },
                     );
-                    // gap
-                    ui.painter().text(
-                        Pos2::new(rect.right() - 4.0, cy),
-                        Align2::RIGHT_CENTER,
-                        gap_text(&row.gap),
-                        FontRoles::mono(13.0),
-                        chrome::TEXT,
-                    );
+
+                    // gap — the animated cell
+                    let (prev_gap, curr_gap, progress) = digit_state.snapshot(row.num);
+                    egui::Area::new(egui::Id::new(("gap_roll", row.num)))
+                        .fixed_pos(egui::pos2(rect.right() - 4.0, cy))
+                        .pivot(egui::Align2::RIGHT_CENTER)
+                        .show(ui.ctx(), |ui| {
+                            crate::digit_roll::render_digit_roll(
+                                ui,
+                                curr_gap,
+                                prev_gap,
+                                progress,
+                                FontRoles::mono(13.0).into(),
+                                chrome::TEXT,
+                            );
+                        });
 
                     if resp.clicked() {
                         selection.toggle(row.num);
